@@ -1,2 +1,7 @@
 build/
 .vscode/
+
+# elf2tab output. Most of it lands in build/ and is already covered, but the
+# per-app Makefiles also drop a copy alongside the sources, which otherwise
+# shows up as untracked after every build.
+*.tab
