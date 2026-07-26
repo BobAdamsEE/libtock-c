@@ -467,11 +467,21 @@ override CFLAGS_cortex-m3 += $(CFLAGS_cortex-m)
 override CFLAGS_cortex-m4 += $(CFLAGS_cortex-m)
 override CFLAGS_cortex-m7 += $(CFLAGS_cortex-m)
 
+# -mno-unaligned-access: Tock's cortex-m MPU driver (arch/cortex-m/src/mpu.rs)
+# builds MPU_RASR from only XN/AP/SRD/SIZE/ENABLE and never sets TEX/S/C/B, so
+# those bits are always 0 -- which encodes Strongly-ordered memory for every
+# process region. Per ARMv7-M ARM A3.2.1, unaligned accesses to Strongly-ordered
+# (or Device) memory ALWAYS raise a UsageFault with UFSR.UNALIGNED, regardless
+# of CCR.UNALIGN_TRP. GCC defaults to -munaligned-access on ARMv7-M and its
+# store-merging and bswap/load-merging passes will happily synthesise unaligned
+# word accesses out of adjacent byte accesses (e.g. folding buf[3..6] into
+# "ldr rN, [rM, #11]" + "rev"). Those are legal ARMv7-M but fault under Tock.
 override CPPFLAGS_cortex-m += \
       $(CPPFLAGS_toolchain_cortex-m)\
       $(CPPFLAGS_PIC)\
       -mthumb\
       -mfloat-abi=soft\
+      -mno-unaligned-access\
       -msingle-pic-base\
       -mpic-register=r9\
       -mno-pic-data-is-text-relative\

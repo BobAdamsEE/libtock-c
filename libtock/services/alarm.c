@@ -236,10 +236,16 @@ static void alarm_upcall(__attribute__ ((unused)) int   kernel_now,
   // to deal with.
   libtock_alarm_ticks_t* head = root_pop();
 
+  // Guard against stale upcall: alarm was cancelled (and root set to NULL)
+  // but the upcall was already queued in the kernel before the cancel syscall.
+  if (head == NULL) {
+    return;
+  }
+
   // Formally, we should be able to just add head to
   // `tocall`, but let's just be defensive just in case there is an
   // errant alarm.
-  assert(head != NULL && !is_within(scheduled, head->reference, head->dt));
+  assert(!is_within(scheduled, head->reference, head->dt));
   head->next  = NULL;
   head->prev  = NULL;
   tocall      = head;
@@ -332,6 +338,8 @@ void libtock_alarm_cancel(libtock_alarm_ticks_t* alarm) {
     root = alarm->next;
     if (root != NULL) {
       libtock_alarm_command_set_absolute(root->reference, root->dt);
+    } else {
+      libtock_alarm_command_stop();
     }
   }
 
