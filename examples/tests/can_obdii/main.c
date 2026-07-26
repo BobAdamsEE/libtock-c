@@ -28,6 +28,7 @@
 #define CMD_STOP_RECEIVE     8
 
 #define SUB_ENABLE           0
+#define SUB_DISABLE          1
 #define SUB_MESSAGE_SENT     2
 #define SUB_MESSAGE_RECEIVED 3
 #define SUB_RECEIVED_STOPPED 4
@@ -216,6 +217,7 @@ static const char* pid_description(uint8_t pid) {
 }
 
 static volatile bool     enabled_done;
+static volatile bool     disabled_done;
 static volatile bool     tx_done;
 static volatile bool     rx_done;
 static volatile bool     stopped_done;
@@ -276,6 +278,11 @@ static void stopped_cb(int a1 __attribute__((unused)), int a2 __attribute__((unu
   stopped_done = true;
 }
 
+static void disabled_cb(int a1 __attribute__((unused)), int a2 __attribute__((unused)),
+                        int a3 __attribute__((unused)), void* ud __attribute__((unused))) {
+  disabled_done = true;
+}
+
 static void error_cb(int a1 __attribute__((unused)), int a2 __attribute__((unused)),
                      int a3 __attribute__((unused)), void* ud __attribute__((unused))) {
   tx_status = 1;
@@ -297,6 +304,7 @@ static int setup_can(void) {
   print("[CAN] Driver found\r\n");
 
   subscribe(CAN_DRIVER_NUM, SUB_ENABLE, enable_cb, NULL);
+  subscribe(CAN_DRIVER_NUM, SUB_DISABLE, disabled_cb, NULL);
   subscribe(CAN_DRIVER_NUM, SUB_MESSAGE_SENT, tx_cb, NULL);
   subscribe(CAN_DRIVER_NUM, SUB_MESSAGE_RECEIVED, rx_cb, NULL);
   subscribe(CAN_DRIVER_NUM, SUB_RECEIVED_STOPPED, stopped_cb, NULL);
@@ -456,11 +464,28 @@ int main(void) {
 
   scan_obdii();
 
+  // Shutdown. Every wait here is bounded and every command's return is
+  // checked: a driver that declines a command never schedules the matching
+  // callback, so an unconditional yield_for() would block forever. That is
+  // exactly what used to happen below -- the bare yield() after CMD_DISABLE
+  // waited for an upcall on SUB_DISABLE, which this app had never subscribed
+  // to, so the process slept forever and never reached tock_exit().
   stopped_done = false;
-  can_cmd(CMD_STOP_RECEIVE, 0, 0);
-  yield_for((bool*)&stopped_done);
-  can_cmd(CMD_DISABLE, 0, 0);
-  yield();
+  if (can_cmd(CMD_STOP_RECEIVE, 0, 0) != RETURNCODE_SUCCESS) {
+    print("[CAN] Stop RX rejected\r\n");
+  } else if (libtocksync_alarm_yield_for_with_timeout((bool*)&stopped_done,
+                                                     RX_TIMEOUT_MS) != RETURNCODE_SUCCESS) {
+    print("[CAN] Stop RX callback timeout\r\n");
+  }
+
+  disabled_done = false;
+  if (can_cmd(CMD_DISABLE, 0, 0) != RETURNCODE_SUCCESS) {
+    print("[CAN] Disable rejected\r\n");
+  } else if (libtocksync_alarm_yield_for_with_timeout((bool*)&disabled_done,
+                                                      RX_TIMEOUT_MS) != RETURNCODE_SUCCESS) {
+    print("[CAN] Disable callback timeout\r\n");
+  }
+
   print("\r\n=== Test Complete ===\r\n");
 
   // Use tock_exit() instead of returning from main(). Returning would invoke
