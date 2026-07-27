@@ -6,7 +6,8 @@
 #include <stddef.h>
 #include <string.h>
 #include <libtock/tock.h>
-#include <libtock/interface/console.h>
+#include <libtock-sync/interface/console.h>
+#include <libtock-sync/net/can.h>
 #include <libtock-sync/services/alarm.h>
 
 // ISO 15765-4 P2_CAN_max = 50 ms; we allow 10× for slow ECUs.
@@ -15,26 +16,16 @@
 #define RX_TIMEOUT_PEND_MS 5000
 // Maximum number of consecutive 0x78 response-pending frames before giving up.
 #define RX_PENDING_MAX     10
+// Give up if this many frames arrive that are not the response we want.
+#define MAX_SKIP           300
 
-#define CAN_DRIVER_NUM  0x20007
+// Functional OBD-II request address, and the responses it draws.
+#define OBD_REQUEST_ID     0x18DB33F1
+#define OBD_RESPONSE_ID    0x18DAF100
+#define OBD_RESPONSE_MASK  0x1FFFFF00
 
-#define CMD_SET_BITRATE      1
-#define CMD_SET_OP_MODE      2
-#define CMD_ENABLE           3
-#define CMD_DISABLE          4
-#define CMD_SEND_STD         5
-#define CMD_SEND_EXT         6
-#define CMD_START_RECEIVE    7
-#define CMD_STOP_RECEIVE     8
-
-#define SUB_ENABLE           0
-#define SUB_DISABLE          1
-#define SUB_MESSAGE_SENT     2
-#define SUB_MESSAGE_RECEIVED 3
-#define SUB_RECEIVED_STOPPED 4
-#define SUB_TX_ERROR         5
-
-#define OP_NORMAL     3
+// Room for a burst of responses; the library drains them one at a time.
+#define RX_MAX_FRAMES      8
 
 typedef struct { uint8_t pid; const char *desc; } pid_desc_t;
 
@@ -216,29 +207,18 @@ static const char* pid_description(uint8_t pid) {
   return "Unknown";
 }
 
-static volatile bool     enabled_done;
-static volatile bool     disabled_done;
-static volatile bool     tx_done;
-static volatile bool     rx_done;
-static volatile bool     stopped_done;
-static volatile uint32_t enable_status;
-static volatile uint32_t tx_status;
-static volatile uint32_t rx_id;
+static uint8_t rx_storage[LIBTOCK_CAN_RX_BUFFER_SIZE(RX_MAX_FRAMES)] __attribute__((aligned(8)));
+static libtock_can_rx_t rx;
+static uint8_t tx_buf[LIBTOCK_CAN_MAX_DLC] __attribute__((aligned(4)));
 
-static uint8_t rx_buf[4 + 8 * 8] __attribute__((aligned(8)));
-static uint8_t tx_buf[8] __attribute__((aligned(4)));
-
-static void reset_rx_buf(void) {
-  memset(rx_buf, 0, sizeof(rx_buf));
-  allow_readwrite(CAN_DRIVER_NUM, 0, rx_buf, sizeof(rx_buf));
-}
-
-static void write_done(returncode_t ret __attribute__((unused)),
-                       uint32_t bytes __attribute__((unused))) {}
-
+// These use the synchronous console rather than an async write followed by a
+// bare yield(). A bare yield() returns on *any* upcall, so with CAN traffic
+// pending it could return before the console write completed -- leaving a
+// stack buffer shared with the kernel after its frame had gone. That is why
+// PID digits occasionally came out blank under bursty receive load.
 static void print(const char* msg) {
-  libtock_console_write((const uint8_t*)msg, strlen(msg), write_done);
-  yield();
+  int written;
+  libtocksync_console_write((const uint8_t*)msg, strlen(msg), &written);
 }
 
 static char hex_char(uint8_t nibble) {
@@ -250,97 +230,50 @@ static void print_hex_byte(uint8_t b) {
   buf[0] = hex_char(b >> 4);
   buf[1] = hex_char(b & 0xF);
   buf[2] = ' ';
-  libtock_console_write((const uint8_t*)buf, 3, write_done);
-  yield();
+  int written;
+  libtocksync_console_write((const uint8_t*)buf, 3, &written);
 }
 
-
-static void enable_cb(int status, int a2 __attribute__((unused)),
-                      int a3 __attribute__((unused)), void* ud __attribute__((unused))) {
-  enable_status = (uint32_t)status;
-  enabled_done = true;
-}
-
-static void tx_cb(int status, int a2 __attribute__((unused)),
-                  int a3 __attribute__((unused)), void* ud __attribute__((unused))) {
-  tx_status = (uint32_t)status;
-  tx_done = true;
-}
-
-static void rx_cb(int status __attribute__((unused)), int offset __attribute__((unused)),
-                  int id, void* ud __attribute__((unused))) {
-  rx_id = (uint32_t)id;
-  rx_done = true;
-}
-
-static void stopped_cb(int a1 __attribute__((unused)), int a2 __attribute__((unused)),
-                       int a3 __attribute__((unused)), void* ud __attribute__((unused))) {
-  stopped_done = true;
-}
-
-static void disabled_cb(int a1 __attribute__((unused)), int a2 __attribute__((unused)),
-                        int a3 __attribute__((unused)), void* ud __attribute__((unused))) {
-  disabled_done = true;
-}
-
-static void error_cb(int a1 __attribute__((unused)), int a2 __attribute__((unused)),
-                     int a3 __attribute__((unused)), void* ud __attribute__((unused))) {
-  tx_status = 1;
-  tx_done   = true;
-}
-
-static returncode_t can_cmd(uint32_t cmd, int arg1, int arg2) {
-  syscall_return_t cval = command(CAN_DRIVER_NUM, cmd, arg1, arg2);
-  return tock_command_return_novalue_to_returncode(cval);
-}
 
 static int setup_can(void) {
   returncode_t ret;
 
-  if (!driver_exists(CAN_DRIVER_NUM)) {
+  if (!libtocksync_can_exists()) {
     print("[CAN] Driver not found\r\n");
     return -1;
   }
   print("[CAN] Driver found\r\n");
 
-  subscribe(CAN_DRIVER_NUM, SUB_ENABLE, enable_cb, NULL);
-  subscribe(CAN_DRIVER_NUM, SUB_DISABLE, disabled_cb, NULL);
-  subscribe(CAN_DRIVER_NUM, SUB_MESSAGE_SENT, tx_cb, NULL);
-  subscribe(CAN_DRIVER_NUM, SUB_MESSAGE_RECEIVED, rx_cb, NULL);
-  subscribe(CAN_DRIVER_NUM, SUB_RECEIVED_STOPPED, stopped_cb, NULL);
-  subscribe(CAN_DRIVER_NUM, SUB_TX_ERROR, error_cb, NULL);
+  libtock_can_rx_init(&rx, rx_storage, sizeof(rx_storage));
 
-  allow_readwrite(CAN_DRIVER_NUM, 0, rx_buf, sizeof(rx_buf));
-  allow_readonly(CAN_DRIVER_NUM, 0, tx_buf, sizeof(tx_buf));
-
-  ret = can_cmd(CMD_SET_BITRATE, 500000, 0);
-  if (ret != RETURNCODE_SUCCESS) {
-    print("[CAN] Set bitrate FAILED\r\n");
-    return -1;
-  }
+  // Bitrate and operation mode are fixed by the board (500 kbps, normal).
   print("[CAN] Bitrate: 500 kbps\r\n");
-
-
-  ret = can_cmd(CMD_SET_OP_MODE, OP_NORMAL, 0);
   print("[CAN] Mode: Normal (external bus)\r\n");
 
+  // Declare which identifiers we want. Nothing is received until we do: the
+  // driver rejects every frame no subscription matches.
+  //
+  // 0x18DAF1xx = 29-bit OBD-II responses addressed to tester 0xF1, which is
+  // who we are when we transmit at 0x18DB33F1.
+  ret = libtocksync_can_subscribe_id(OBD_RESPONSE_ID, true, OBD_RESPONSE_MASK);
   if (ret != RETURNCODE_SUCCESS) {
-    print("[CAN] Set mode FAILED\r\n");
+    print("[CAN] Subscribe FAILED\r\n");
     return -1;
   }
+  print("[CAN] Subscribed: 0x18DAF1xx\r\n");
 
-  enabled_done = false;
-  ret = can_cmd(CMD_ENABLE, 0, 0);
+  ret = libtocksync_can_enable();
   if (ret != RETURNCODE_SUCCESS) {
     print("[CAN] Enable FAILED\r\n");
     return -1;
   }
-  yield_for((bool*)&enabled_done);
-  if (enable_status != 0) {
-    print("[CAN] Enable callback error\r\n");
+  print("[CAN] Enabled\r\n");
+
+  ret = libtocksync_can_start_receive(&rx);
+  if (ret != RETURNCODE_SUCCESS) {
+    print("[CAN] Start RX FAILED\r\n");
     return -1;
   }
-  print("[CAN] Enabled\r\n");
   return 0;
 }
 
@@ -348,77 +281,74 @@ static int setup_can(void) {
 // 32-bit bitmask from the ECU response. Returns false on any error.
 static bool query_range(uint8_t range_pid, uint32_t *mask_out) {
   returncode_t ret;
+  libtock_can_frame_t frame;
 
-  memset(rx_buf, 0, sizeof(rx_buf));
-  allow_readwrite(CAN_DRIVER_NUM, 0, rx_buf, sizeof(rx_buf));
-  rx_done = false;
+  // Drop anything left from a previous query so stale frames are not mistaken
+  // for this one's answer.
+  ret = libtock_can_rx_reset(&rx);
+  if (ret != RETURNCODE_SUCCESS) { print("[RX] buffer reset failed\r\n"); return false; }
 
   tx_buf[0] = 0x02; tx_buf[1] = 0x01; tx_buf[2] = range_pid;
   tx_buf[3] = 0; tx_buf[4] = 0; tx_buf[5] = 0; tx_buf[6] = 0; tx_buf[7] = 0;
-  allow_readonly(CAN_DRIVER_NUM, 0, tx_buf, sizeof(tx_buf));
 
-  tx_done = false;
-  ret = can_cmd(CMD_SEND_EXT, 0x18DB33F1, 8);
-  if (ret != RETURNCODE_SUCCESS) { print("[TX] send failed\r\n"); return false; }
-  int tx_rc = libtocksync_alarm_yield_for_with_timeout((bool*)&tx_done, RX_TIMEOUT_MS);
-  if (tx_rc != RETURNCODE_SUCCESS) { print("[TX] timeout (no ACK — bus empty?)\r\n"); return false; }
-  if (tx_status != 0) { print("[TX] error\r\n"); return false; }
+  ret = libtocksync_can_send(OBD_REQUEST_ID, true, tx_buf, sizeof(tx_buf), RX_TIMEOUT_MS);
+  if (ret != RETURNCODE_SUCCESS) {
+    print("[TX] timeout or error (no ACK — bus empty?)\r\n");
+    return false;
+  }
 
-  // Wait for ECU response, retrying on 0x78 response-pending NRC.
-  // Hardware filter passes 0x700–0x7FF (standard) and all extended frames.
-  // We log and skip anything outside the standard OBD-II diagnostic range.
-  uint8_t *msg = &rx_buf[8]; // StreamingProcessSlice header is 8 bytes
+  // Wait for the ECU's answer, tolerating 0x78 "response pending" and
+  // ignoring anything else that matched our subscription. Frames are taken one
+  // at a time, so a burst that arrived while we were descheduled is drained
+  // rather than collapsed into a single notification.
   int pending = 0;
   int skipped = 0;
-  int timeout_ms = RX_TIMEOUT_MS;
-#define MAX_SKIP 300
+  uint32_t timeout_ms = RX_TIMEOUT_MS;
+
   while (1) {
-    int rc = libtocksync_alarm_yield_for_with_timeout((bool*)&rx_done, timeout_ms);
-    if (rc != RETURNCODE_SUCCESS) {
-      print("[RX] timeout (no ECU response)\r\n");
+    ret = libtocksync_can_read_frame(&rx, &frame, timeout_ms);
+    if (ret != RETURNCODE_SUCCESS) {
+      // Distinguish "nothing arrived" from "more arrived than fits": running
+      // out of buffer also ends in a wait that never completes, but the cause
+      // and the fix are entirely different.
+      if (libtock_can_rx_overflowed(&rx)) {
+        print("[RX] buffer overflowed, frames lost\r\n");
+      } else {
+        print("[RX] timeout (no ECU response)\r\n");
+      }
       return false;
     }
 
-    // Accept only 29-bit OBD-II responses: upper 24 bits must be 0x18DAF1.
-    // (The "literal pool constants trigger LDRD" note that used to live here was
-    // a misdiagnosis; literal pools are always word-aligned. Kept as-is only
-    // because the shift form is equally clear.)
-    // Also reset the rx_buf streaming slice on each skip so non-OBD extended
-    // frames don't fill the 60-byte payload before the ECU response arrives.
-    if (((rx_id >> 8) & 0xFFFFFFu) != 0x18DAF1u) {
-      rx_done = false;
-      reset_rx_buf();
-      if (++skipped > MAX_SKIP) {
-        print("[RX] no OBD response after many frames\r\n");
-        return false;
-      }
-      continue;
+    if (libtock_can_rx_overflowed(&rx)) {
+      print("[RX] buffer overflowed, frames lost\r\n");
+      return false;
     }
 
-    // 0x7F = negative response; 0x78 NRC = response pending, real answer coming
-    if (msg[1] == 0x7F && msg[3] == 0x78) {
-      pending++;
-      if (pending > RX_PENDING_MAX) {
+    // 0x7F = negative response; 0x78 NRC = response pending, real answer still
+    // coming, so extend the deadline to P2*.
+    if (frame.length >= 4 && frame.data[1] == 0x7F && frame.data[3] == 0x78) {
+      if (++pending > RX_PENDING_MAX) {
         print("[RX] too many response-pending (0x78)\r\n");
         return false;
       }
-      rx_done = false;
       timeout_ms = RX_TIMEOUT_PEND_MS;
       continue;
     }
 
-    break;
-  }
+    // Normal addressing: [0]=len, [1]=0x41, [2]=pid, [3..6]=mask
+    if (frame.length >= 7 && frame.data[1] == 0x41 && frame.data[2] == range_pid) {
+      break;
+    }
 
-  // Normal addressing: msg[0]=len, msg[1]=0x41, msg[2]=pid, msg[3..6]=mask
-  if (msg[1] != 0x41 || msg[2] != range_pid) {
-    print("[RX] unexpected response\r\n");
-    return false;
+    if (++skipped > MAX_SKIP) {
+      print("[RX] no OBD response after many frames\r\n");
+      return false;
+    }
   }
 
   // 4-byte bitmask: bit 31 = range_pid+1, bit 0 = range_pid+0x20
-  *mask_out = ((uint32_t)msg[3] << 24) | ((uint32_t)msg[4] << 16)
-            | ((uint32_t)msg[5] << 8)  |  (uint32_t)msg[6];
+  *mask_out = ((uint32_t)frame.data[3] << 24) | ((uint32_t)frame.data[4] << 16)
+            | ((uint32_t)frame.data[5] << 8)  |  (uint32_t)frame.data[6];
   return true;
 }
 
@@ -431,14 +361,6 @@ static void print_pid(uint8_t pid) {
 }
 
 static void scan_obdii(void) {
-  returncode_t ret;
-
-  memset(rx_buf, 0, sizeof(rx_buf));
-  allow_readwrite(CAN_DRIVER_NUM, 0, rx_buf, sizeof(rx_buf));
-
-  ret = can_cmd(CMD_START_RECEIVE, 0, 0);
-  if (ret != RETURNCODE_SUCCESS) { print("[CAN] Start RX FAILED\r\n"); return; }
-
   print("[OBD] Scanning supported PIDs...\r\n\r\n");
 
   uint8_t range_pid = 0x00;
@@ -464,26 +386,14 @@ int main(void) {
 
   scan_obdii();
 
-  // Shutdown. Every wait here is bounded and every command's return is
-  // checked: a driver that declines a command never schedules the matching
-  // callback, so an unconditional yield_for() would block forever. That is
-  // exactly what used to happen below -- the bare yield() after CMD_DISABLE
-  // waited for an upcall on SUB_DISABLE, which this app had never subscribed
-  // to, so the process slept forever and never reached tock_exit().
-  stopped_done = false;
-  if (can_cmd(CMD_STOP_RECEIVE, 0, 0) != RETURNCODE_SUCCESS) {
-    print("[CAN] Stop RX rejected\r\n");
-  } else if (libtocksync_alarm_yield_for_with_timeout((bool*)&stopped_done,
-                                                     RX_TIMEOUT_MS) != RETURNCODE_SUCCESS) {
-    print("[CAN] Stop RX callback timeout\r\n");
+  // Shutdown. The library only waits after a command the driver accepted, so
+  // a declined command cannot leave us blocked on a callback that will never
+  // come -- which is what used to hang this app before it exited.
+  if (libtocksync_can_stop_receive() != RETURNCODE_SUCCESS) {
+    print("[CAN] Stop RX failed\r\n");
   }
-
-  disabled_done = false;
-  if (can_cmd(CMD_DISABLE, 0, 0) != RETURNCODE_SUCCESS) {
-    print("[CAN] Disable rejected\r\n");
-  } else if (libtocksync_alarm_yield_for_with_timeout((bool*)&disabled_done,
-                                                      RX_TIMEOUT_MS) != RETURNCODE_SUCCESS) {
-    print("[CAN] Disable callback timeout\r\n");
+  if (libtocksync_can_disable() != RETURNCODE_SUCCESS) {
+    print("[CAN] Disable failed\r\n");
   }
 
   print("\r\n=== Test Complete ===\r\n");
