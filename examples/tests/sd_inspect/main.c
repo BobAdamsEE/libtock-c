@@ -578,6 +578,143 @@ static bool find_fs(void) {
 
 static uint32_t n_live_files, n_live_dirs, n_del_files, n_del_dirs, n_del_intact;
 
+// ----- What an entry is: user content, an OS artifact, or in a trash -------
+//
+// Nearly every card has been mounted by some OS, which leaves files of its
+// own (Windows' System Volume Information above all). Those say "this card was
+// mounted", not "this card holds someone's data", so they are counted apart.
+// A trash folder is an artifact too, but what is *in* it is user data the
+// user deleted -- "present" only in the narrowest sense -- so it gets a class
+// of its own.
+
+// K_OS_SHELL: a folder an OS creates whose contents are nonetheless user
+// data (Android's LOST.DIR, which holds fragments recovered after corruption).
+typedef enum { K_USER, K_OS, K_OS_SHELL, K_TRASH_DIR, K_TRASHED } kind_t;
+typedef enum { OS_NONE = 0, OS_WINDOWS = 1, OS_MACOS = 2, OS_LINUX = 4, OS_ANDROID = 8 } os_t;
+
+typedef struct {
+  uint8_t kind;  // kind_t
+  uint8_t os;    // os_t of the artifact or trash this entry belongs to
+} cls_t;
+
+static const cls_t CLS_USER = {K_USER, OS_NONE};
+
+static uint32_t n_user_files, n_user_dirs, n_os_files, n_os_dirs, n_trashed_files, n_trashed_dirs;
+static uint32_t n_del_user, n_del_os;  // deleted directory entries (files + dirs), by class
+static uint8_t os_seen;                // os_t bits of every artifact found
+
+// Case-insensitive compare. FAT names are case-insensitive, and a deleted
+// entry without a long name has lost its first character, so that one may be
+// skipped.
+static bool name_is(const char* name, const char* want, bool skip_first) {
+  if (skip_first) {
+    if (!*name || !*want) return false;
+    name++;
+    want++;
+  }
+  for (; *name && *want; name++, want++) {
+    char a = *name, b = *want;
+    if (a >= 'a' && a <= 'z') a -= 32;
+    if (b >= 'a' && b <= 'z') b -= 32;
+    if (a != b) return false;
+  }
+  return *name == 0 && *want == 0;
+}
+
+static bool name_starts(const char* name, const char* prefix, bool skip_first) {
+  if (skip_first) {
+    if (!*name || !*prefix) return false;
+    name++;
+    prefix++;
+  }
+  for (; *prefix; name++, prefix++) {
+    char a = *name, b = *prefix;
+    if (a >= 'a' && a <= 'z') a -= 32;
+    if (b >= 'a' && b <= 'z') b -= 32;
+    if (a != b) return false;
+  }
+  return true;
+}
+
+static bool all_digits(const char* s) {
+  if (!*s) return false;
+  for (; *s; s++)
+    if (*s < '0' || *s > '9') return false;
+  return true;
+}
+
+// Class of an entry named `name` inside a directory of class `parent`.
+// `blind` = deleted with no long name, so the first character is unknown.
+static cls_t classify(cls_t parent, const char* name, bool is_dir, int depth, bool blind) {
+  cls_t os = {K_OS, parent.os};
+
+  // Inside an artifact: more of it. Inside trashed data: more trashed data.
+  if (parent.kind == K_OS) return parent;
+  if (parent.kind == K_TRASHED) return parent;
+
+  // Anywhere: per-folder metadata files.
+  static const char* const mac_files[] = {".DS_Store", ".metadata_never_index", ".apdisk", ".VolumeIcon.icns"};
+  for (unsigned i = 0; i < sizeof(mac_files) / sizeof(mac_files[0]); i++)
+    if (!is_dir && name_is(name, mac_files[i], blind)) return (cls_t){K_OS, OS_MACOS};
+  if (!is_dir && name_starts(name, "._", blind)) return (cls_t){K_OS, OS_MACOS};  // AppleDouble
+  static const char* const win_files[] = {"Thumbs.db", "ehthumbs.db", "desktop.ini"};
+  for (unsigned i = 0; i < sizeof(win_files) / sizeof(win_files[0]); i++)
+    if (!is_dir && name_is(name, win_files[i], blind)) return (cls_t){K_OS, OS_WINDOWS};
+
+  // Inside a trash folder: its own bookkeeping is an artifact, the rest is
+  // what was thrown away.
+  if (parent.kind == K_TRASH_DIR) {
+    switch (parent.os) {
+      case OS_WINDOWS:
+        // $RECYCLE.BIN/<SID>/ holds $I<id> (index) and $R<id> (data) pairs;
+        // XP's RECYCLER keeps INFO2 and Dc<n> files.
+        if (is_dir && name_starts(name, "S-1-", blind)) return parent;
+        if (!is_dir && (name_starts(name, "$I", blind) || name_is(name, "INFO2", blind))) return os;
+        break;
+      case OS_LINUX:
+        // .Trash-<uid>/files/ holds the data, info/ the .trashinfo records.
+        if (is_dir && name_is(name, "files", blind)) return parent;
+        if (name_is(name, "info", blind) || name_is(name, "directorysizes", blind)) return os;
+        break;
+      case OS_MACOS:
+        if (is_dir && all_digits(name)) return parent;  // .Trashes/<uid>/
+        break;
+    }
+    return (cls_t){K_TRASHED, parent.os};
+  }
+
+  // Root only: whole-volume folders an OS creates on mount.
+  if (depth == 0 && is_dir) {
+    if (name_is(name, "System Volume Information", blind)) return (cls_t){K_OS, OS_WINDOWS};
+    if (name_is(name, "$RECYCLE.BIN", blind) || name_is(name, "RECYCLER", blind) ||
+        name_is(name, "RECYCLED", blind))
+      return (cls_t){K_TRASH_DIR, OS_WINDOWS};
+    if (name_starts(name, ".Trash-", blind)) return (cls_t){K_TRASH_DIR, OS_LINUX};
+    if (name_is(name, ".Trashes", blind)) return (cls_t){K_TRASH_DIR, OS_MACOS};
+    static const char* const mac_dirs[] = {".Spotlight-V100", ".fseventsd", ".TemporaryItems",
+                                           ".DocumentRevisions-V100"};
+    for (unsigned i = 0; i < sizeof(mac_dirs) / sizeof(mac_dirs[0]); i++)
+      if (name_is(name, mac_dirs[i], blind)) return (cls_t){K_OS, OS_MACOS};
+    if (name_is(name, "LOST.DIR", blind)) return (cls_t){K_OS_SHELL, OS_ANDROID};
+  }
+  return CLS_USER;
+}
+
+static const char* os_name(uint8_t os) {
+  return os == OS_WINDOWS ? "Windows" : os == OS_MACOS ? "macOS" : os == OS_LINUX ? "Linux" :
+         os == OS_ANDROID ? "Android" : "?";
+}
+
+static void print_class(cls_t c) {
+  switch (c.kind) {
+    case K_OS: printf("  [%s artifact]", os_name(c.os)); break;
+    case K_OS_SHELL: printf("  [%s folder]", os_name(c.os)); break;
+    case K_TRASH_DIR: printf("  [%s trash]", os_name(c.os)); break;
+    case K_TRASHED: printf("  [in %s trash]", os_name(c.os)); break;
+    default: break;
+  }
+}
+
 // Live files, remembered so their slack can be carved. Slack -- the part of a
 // file's last cluster beyond its end -- keeps whatever the cluster held
 // before, which is often the start of a deleted file whose first clusters
@@ -640,9 +777,10 @@ static void print_date(const uint8_t* d) {
   printf("%04u-%02u-%02u %02u:%02u", 1980 + (dt >> 9), (dt >> 5) & 15, dt & 31, t >> 11, (t >> 5) & 63);
 }
 
-static void walk_dir(uint32_t cluster, int depth, bool in_deleted, const char* path);
+static void walk_dir(uint32_t cluster, int depth, bool in_deleted, const char* path, cls_t cls);
 
-static void dir_entry(const uint8_t* d, const char* lfn, int depth, bool in_deleted, const char* path) {
+static void dir_entry(const uint8_t* d, const char* lfn, int depth, bool in_deleted, const char* path,
+                      cls_t parent) {
   uint8_t attr = d[11];
   bool deleted = d[0] == 0xE5;
 
@@ -668,23 +806,51 @@ static void dir_entry(const uint8_t* d, const char* lfn, int depth, bool in_dele
   uint32_t size = le32(d + 28);
   const char* state = deleted ? "DELETED" : in_deleted ? "DELETED*" : "PRESENT";
 
-  if (attr & 0x10) {
-    if (deleted || in_deleted) n_del_dirs++; else n_live_dirs++;
+  bool is_dir = attr & 0x10;
+  bool gone = deleted || in_deleted;
+  cls_t cls = classify(parent, shown, is_dir, depth, deleted && !lfn[0]);
+  if (cls.kind != K_USER) os_seen |= cls.os;
+  // A deleted entry counts as user data unless it is an OS artifact; deleted
+  // from a trash is still deleted user data.
+  bool os_item = cls.kind == K_OS || cls.kind == K_OS_SHELL || cls.kind == K_TRASH_DIR;
+  if (gone) {
+    if (os_item) n_del_os++; else n_del_user++;
+  }
+
+  if (is_dir) {
+    if (gone) {
+      n_del_dirs++;
+    } else {
+      n_live_dirs++;
+      if (cls.kind == K_TRASHED) n_trashed_dirs++;
+      else if (os_item) n_os_dirs++;
+      else n_user_dirs++;
+    }
     printf("  %-8s <DIR>       ", state);
     print_date(d);
-    printf("  %s%s/\r\n", path, shown);
+    printf("  %s%s/", path, shown);
+    print_class(cls);
+    printf("\r\n");
     if (depth + 1 < MAX_DEPTH && cluster_valid(cl)) {
       char sub[160];
       snprintf(sub, sizeof(sub), "%s%s/", path, shown);
-      walk_dir(cl, depth + 1, in_deleted || deleted, sub);
+      // Inside an Android LOST.DIR, entries are classified as ordinary ones.
+      walk_dir(cl, depth + 1, gone, sub, cls.kind == K_OS_SHELL ? CLS_USER : cls);
     }
     return;
   }
 
   printf("  %-8s %10lu  ", state, (unsigned long)size);
   print_date(d);
-  printf("  %s%s\r\n", path, shown);
-  if (deleted || in_deleted) {
+  printf("  %s%s", path, shown);
+  print_class(cls);
+  printf("\r\n");
+  if (!gone) {
+    if (cls.kind == K_TRASHED) n_trashed_files++;
+    else if (os_item) n_os_files++;
+    else n_user_files++;
+  }
+  if (gone) {
     n_del_files++;
     printf("           start cluster %lu: ", (unsigned long)cl);
     if (size == 0 || cl == 0) {
@@ -718,7 +884,7 @@ static void dir_entry(const uint8_t* d, const char* lfn, int depth, bool in_dele
 
 // Walk a directory. `cluster` 0 means the FAT12/16 fixed root. A deleted
 // directory's chain was freed with it, so only its first cluster is read.
-static void walk_dir(uint32_t cluster, int depth, bool in_deleted, const char* path) {
+static void walk_dir(uint32_t cluster, int depth, bool in_deleted, const char* path, cls_t cls) {
   uint8_t s[512];
   char lfn[128];
   lfn[0] = 0;
@@ -757,7 +923,7 @@ static void walk_dir(uint32_t cluster, int depth, bool in_deleted, const char* p
           lfn[0] = 0;
           continue;
         }
-        dir_entry(d, lfn, depth, in_deleted, path);
+        dir_entry(d, lfn, depth, in_deleted, path, cls);
         lfn[0] = 0;
       }
     }
@@ -1022,8 +1188,8 @@ static void carve_raw(uint32_t blocks) {
 // the serial number, and the volume serial and label) are included here and
 // left to the host to keep private.
 
-#define SDREC_SCHEMA 1
-#define SD_INSPECT_VERSION "1.2"
+#define SDREC_SCHEMA 2  // 2: entries classified (user / OS artifact / trash), tagged verdict
+#define SD_INSPECT_VERSION "1.3"
 
 static void json_hex(const char* key, const uint8_t* p, int n) {
   printf("\"%s\":\"", key);
@@ -1046,11 +1212,32 @@ static void json_field(const char* key, const char* s, int maxlen) {
   printf("\"");
 }
 
-static const char* verdict(bool have_fs) {
-  bool present = have_fs && n_live_files > 0;
-  bool deleted = n_del_files > 0 || n_del_dirs > 0 || n_headers > 0;
-  return present && deleted ? "present+deleted" : present ? "present" : deleted ? "deleted" : "blank";
+// Tags, joined with '+', in a fixed order:
+//   user      files of the user's own (OS artifacts excluded)
+//   trashed   files sitting in an OS trash folder
+//   deleted   deleted user directory entries, or file headers carved from
+//             unallocated space
+//   residual  unallocated data, but nothing identifiable in it
+// or "clean" when there is none of these. Which OSes left artifacts is
+// reported separately, because nearly every card has some.
+static const char* verdict(void) {
+  static char buf[40];
+  bool deleted = n_del_user > 0 || n_headers > 0;
+  buf[0] = 0;
+  if (n_user_files) strcat(buf, "+user");
+  if (n_trashed_files) strcat(buf, "+trashed");
+  if (deleted) strcat(buf, "+deleted");
+  if (!deleted && residual_sectors) strcat(buf, "+residual");
+  return buf[0] ? buf + 1 : "clean";
 }
+
+// stdout is buffered, so without this the whole ~1.1 KB line reaches the
+// console as one write -- larger than the 1 KiB SEGGER RTT ring the console
+// is mirrored to, which then overwrites its own unread start. Flushing per
+// section hands the console pieces of a few hundred bytes, each paced by the
+// UART, so an RTT reader can keep up. Measured: unflushed, two captures in a
+// row lost ~30 bytes at offset ~1017.
+#define RECORD_FLUSH() fflush(stdout)
 
 static void emit_record(const sdmmc_info_t* ci, bool have_info, bool have_fs, bool card_detect,
                         uint32_t init_ms, uint32_t blocks) {
@@ -1059,10 +1246,11 @@ static void emit_record(const sdmmc_info_t* ci, bool have_info, bool have_fs, bo
     json_hex("cid", ci->cid, 16); printf(",");
     json_hex("csd", ci->csd, 16); printf(",");
     json_hex("scr", ci->scr, 8); printf(",");
+    RECORD_FLUSH();
     // Absent rather than zero when unread, so a zero register is never
     // mistaken for a real one.
-    if (ci->ssr_valid) { json_hex("ssr", ci->ssr, 64); printf(","); }
-    if (ci->switch_valid) { json_hex("switch", ci->switch_status, 64); printf(","); }
+    if (ci->ssr_valid) { json_hex("ssr", ci->ssr, 64); printf(","); RECORD_FLUSH(); }
+    if (ci->switch_valid) { json_hex("switch", ci->switch_status, 64); printf(","); RECORD_FLUSH(); }
     printf("\"ocr\":\"%08lX\",\"rca\":\"%04X\",", (unsigned long)ci->ocr, ci->rca);
     printf("\"bus_width\":%u,\"clock_hz\":%lu,", ci->bus_width, (unsigned long)ci->clock_hz);
   }
@@ -1070,6 +1258,7 @@ static void emit_record(const sdmmc_info_t* ci, bool have_info, bool have_fs, bo
          card_detect ? "true" : "false");
   printf("\"read_kBps\":{\"multi\":%lu,\"single\":%lu,\"carve\":%lu},", (unsigned long)bench_multi_kBps,
          (unsigned long)bench_single_kBps, (unsigned long)carve_kBps);
+  RECORD_FLUSH();
 
   printf("\"partition_table\":\"%s\",\"partitions\":[", part_table);
   for (int i = 0; i < n_parts; i++) {
@@ -1077,6 +1266,7 @@ static void emit_record(const sdmmc_info_t* ci, bool have_info, bool have_fs, bo
            parts[i].active ? "true" : "false", (unsigned long)parts[i].lba, (unsigned long)parts[i].sectors);
   }
   printf("],");
+  RECORD_FLUSH();
 
   if (have_fs) {
     printf("\"filesystem\":{\"type\":\"FAT%d\",\"lba\":%lu,\"sectors\":%lu,\"cluster_sectors\":%u,"
@@ -1090,12 +1280,30 @@ static void emit_record(const sdmmc_info_t* ci, bool have_info, bool have_fs, bo
   } else {
     printf("\"filesystem\":%s,", exfat_seen ? "{\"type\":\"exFAT\"}" : "null");
   }
+  RECORD_FLUSH();
 
-  printf("\"content\":{\"verdict\":\"%s\",\"fs_parsed\":%s,", verdict(have_fs), have_fs ? "true" : "false");
+  printf("\"content\":{\"verdict\":\"%s\",\"fs_parsed\":%s,\"os_artifacts\":[", verdict(),
+         have_fs ? "true" : "false");
+  static const uint8_t oses[] = {OS_WINDOWS, OS_MACOS, OS_LINUX, OS_ANDROID};
+  static const char* const os_keys[] = {"windows", "macos", "linux", "android"};
+  bool first = true;
+  for (int i = 0; i < 4; i++) {
+    if (os_seen & oses[i]) {
+      printf("%s\"%s\"", first ? "" : ",", os_keys[i]);
+      first = false;
+    }
+  }
+  printf("],");
+  printf("\"user_files\":%lu,\"user_dirs\":%lu,\"os_files\":%lu,\"os_dirs\":%lu,", (unsigned long)n_user_files,
+         (unsigned long)n_user_dirs, (unsigned long)n_os_files, (unsigned long)n_os_dirs);
+  printf("\"trashed_files\":%lu,\"trashed_dirs\":%lu,", (unsigned long)n_trashed_files,
+         (unsigned long)n_trashed_dirs);
+  RECORD_FLUSH();
   printf("\"present_files\":%lu,\"present_dirs\":%lu,\"present_bytes\":%lu,", (unsigned long)n_live_files,
          (unsigned long)n_live_dirs, (unsigned long)live_bytes);
   printf("\"deleted_files\":%lu,\"deleted_dirs\":%lu,\"deleted_intact\":%lu,", (unsigned long)n_del_files,
          (unsigned long)n_del_dirs, (unsigned long)n_del_intact);
+  printf("\"deleted_user\":%lu,\"deleted_os\":%lu,", (unsigned long)n_del_user, (unsigned long)n_del_os);
   printf("\"carved_headers\":%lu,\"carved_video\":%lu,\"residual_kib\":%lu,", (unsigned long)n_headers,
          (unsigned long)n_video_headers, (unsigned long)(residual_sectors / 2));
   printf("\"read_errors\":%lu}}\r\n", (unsigned long)read_errors);
@@ -1133,7 +1341,7 @@ int main(void) {
   if (have_fs) {
     printf("\r\n=== Directory tree (DELETED* = inside a deleted directory) ===\r\n");
     printf("  state          size  modified          name\r\n");
-    walk_dir(fs.type == 32 ? fs.root_cluster : 0, 0, false, "/");
+    walk_dir(fs.type == 32 ? fs.root_cluster : 0, 0, false, "/", CLS_USER);
     if (!n_live_files && !n_live_dirs && !n_del_files && !n_del_dirs) printf("  (empty)\r\n");
     carve_free_space();
     carve_slack_and_gaps(blocks);
@@ -1143,31 +1351,53 @@ int main(void) {
 
   printf("\r\n=== Summary ===\r\n");
   if (have_fs) {
-    printf("  Files plainly present:          %lu (%lu dirs), %lu bytes\r\n", (unsigned long)n_live_files,
+    printf("  User files present:             %lu (%lu dirs)\r\n", (unsigned long)n_user_files,
+           (unsigned long)n_user_dirs);
+    printf("  OS artifacts:                   %lu files, %lu dirs", (unsigned long)n_os_files,
+           (unsigned long)n_os_dirs);
+    if (os_seen) {
+      printf(" (");
+      bool first = true;
+      for (uint8_t bit = 1; bit <= OS_ANDROID; bit <<= 1) {
+        if (os_seen & bit) {
+          printf("%s%s", first ? "" : ", ", os_name(bit));
+          first = false;
+        }
+      }
+      printf(")");
+    }
+    printf("\r\n");
+    printf("  In a trash folder:              %lu files (%lu dirs)\r\n", (unsigned long)n_trashed_files,
+           (unsigned long)n_trashed_dirs);
+    printf("  All present, total:             %lu files (%lu dirs), %lu bytes\r\n", (unsigned long)n_live_files,
            (unsigned long)n_live_dirs, (unsigned long)live_bytes);
     printf("  Deleted directory entries:      %lu files, %lu dirs; %lu with data not reused\r\n",
            (unsigned long)n_del_files, (unsigned long)n_del_dirs, (unsigned long)n_del_intact);
+    printf("    of which user / OS artifact:  %lu / %lu\r\n", (unsigned long)n_del_user, (unsigned long)n_del_os);
   }
   printf("  Residual data in %s:   %lu KiB in %lu runs\r\n", have_fs ? "unallocated" : "the card   ",
          (unsigned long)(residual_sectors / 2), (unsigned long)(n_raw_runs + n_headers));
   printf("  File headers found there:       %lu (%lu video), %lu embedded\r\n", (unsigned long)n_headers,
          (unsigned long)n_video_headers, (unsigned long)n_nested);
   printf("  Read errors:                    %lu\r\n", (unsigned long)read_errors);
-  printf("\r\n  Verdict: ");
-  if (have_fs && n_live_files) printf("files PRESENT; ");
-  else printf("no files present; ");
-  if (n_del_intact || n_headers) {
-    printf("DELETED content recoverable:\r\n");
-    if (n_del_intact)
-      printf("    %lu deleted directory entr%s with data not reused (undelete)\r\n", (unsigned long)n_del_intact,
-             n_del_intact == 1 ? "y" : "ies");
+  printf("\r\n  Verdict: %s\r\n", verdict());
+  if (n_user_files) printf("    user files PRESENT\r\n");
+  else if (n_os_files || n_os_dirs) printf("    no user files -- only artifacts of the OS that mounted it\r\n");
+  else printf("    no files present\r\n");
+  if (n_trashed_files) printf("    %lu file(s) in a trash folder: deleted by the user, still intact\r\n",
+                              (unsigned long)n_trashed_files);
+  if (n_del_user || n_headers) {
+    printf("    DELETED user content:\r\n");
+    if (n_del_user)
+      printf("      %lu deleted directory entr%s, %lu with data not reused (undelete)\r\n", (unsigned long)n_del_user,
+             n_del_user == 1 ? "y" : "ies", (unsigned long)n_del_intact);
     if (n_headers)
-      printf("    %lu file header(s) in unallocated space, %lu of them video (carving, photorec-style)\r\n",
+      printf("      %lu file header(s) in unallocated space, %lu of them video (carving, photorec-style)\r\n",
              (unsigned long)n_headers, (unsigned long)n_video_headers);
   } else if (residual_sectors) {
-    printf("residual data in unallocated space but no recognisable file headers\r\n");
+    printf("    residual data in unallocated space, but no recognisable file headers\r\n");
   } else {
-    printf("unallocated space is blank -- nothing to recover\r\n");
+    printf("    unallocated space is blank -- nothing to recover\r\n");
   }
   printf("\r\n");
   emit_record(&info, have_info, have_fs, present, init_ms, blocks);
