@@ -55,6 +55,7 @@ returncode_t sdmmc_get_info(sdmmc_info_t* info) {
   info->clock_hz = le32(&raw[52]);
   info->ssr_valid = (raw[46] >> 2) & 1;
   info->switch_valid = (raw[46] >> 3) & 1;
+  info->bus_fallback = (raw[46] >> 4) & 1;
   for (int i = 0; i < 64; i++) info->ssr[i] = raw[56 + i];
   for (int i = 0; i < 64; i++) info->switch_status[i] = raw[120 + i];
   return RETURNCODE_SUCCESS;
@@ -78,4 +79,25 @@ returncode_t sdmmc_read(uint32_t lba, uint32_t count, uint8_t* buf) {
   (void)unallow;
   if (rc == RETURNCODE_SUCCESS && copied != count * SDMMC_BLOCK_SIZE) rc = RETURNCODE_FAIL;
   return rc;
+}
+
+returncode_t sdmmc_error_info(int which, sdmmc_error_t* err) {
+  syscall_return_t r = command(DRIVER_NUM_SDMMC, 6, which, 0);
+  if (r.type != TOCK_SYSCALL_SUCCESS_U32_U32_U32) return RETURNCODE_FAIL;
+  err->cmd = r.data[0] & 0xFF;
+  err->stage = (r.data[0] >> 8) & 0xFF;
+  err->card_state = (r.data[0] >> 16) & 0xFF;
+  err->sr = r.data[1];
+  err->r1 = r.data[2];
+  return RETURNCODE_SUCCESS;
+}
+
+returncode_t sdmmc_set_bus(uint32_t width, uint32_t hz, uint32_t* actual_hz) {
+  syscall_return_t r = command(DRIVER_NUM_SDMMC, 7, width, hz);
+  return tock_command_return_u32_to_returncode(r, actual_hz);
+}
+
+returncode_t sdmmc_set_timeout(uint32_t ms) {
+  syscall_return_t r = command(DRIVER_NUM_SDMMC, 8, ms, 0);
+  return tock_command_return_novalue_to_returncode(r);
 }

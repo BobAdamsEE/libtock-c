@@ -24,7 +24,6 @@
 #include "sdmmc.h"
 
 #define MAX_DEPTH        6
-#define MAX_READ_ERRORS  20
 #define MAX_HEADER_LINES 64
 #define MAX_RAW_RUNS     16
 
@@ -76,15 +75,175 @@ static uint32_t now_ms(void) {
 
 static uint32_t read_errors;
 
+// One line explaining a failure: where it failed, the controller's error bits
+// (SAMV71 HSMCI_SR) and the card's R1 error bits, and the card state after.
+static void print_error(const sdmmc_error_t* e) {
+  static const char* const stages[] = {"none", "response", "card status", "data", "busy", "stuck"};
+  printf("CMD%u %s", e->cmd, e->stage < 6 ? stages[e->stage] : "?");
+  static const struct { uint32_t bit; const char* name; } srb[] = {
+    {1u << 16, "RINDE"}, {1u << 17, "RDIRE"}, {1u << 18, "RCRCE"}, {1u << 19, "RENDE"},
+    {1u << 20, "RTOE"}, {1u << 21, "DCRCE"}, {1u << 22, "DTOE"}, {1u << 23, "CSTOE"},
+    {1u << 30, "OVRE"}, {1u << 31, "UNRE"},
+  };
+  printf(" [SR");
+  for (unsigned i = 0; i < sizeof(srb) / sizeof(srb[0]); i++)
+    if (e->sr & srb[i].bit) printf(" %s", srb[i].name);
+  printf("]");
+  if (e->stage == SDMMC_STAGE_CARD_STATUS || e->stage == SDMMC_STAGE_DATA) {
+    static const struct { uint32_t bit; const char* name; } r1b[] = {
+      {1u << 31, "OUT_OF_RANGE"}, {1u << 30, "ADDRESS_ERROR"}, {1u << 29, "BLOCK_LEN"},
+      {1u << 23, "COM_CRC"}, {1u << 22, "ILLEGAL_CMD"}, {1u << 21, "CARD_ECC_FAILED"},
+      {1u << 20, "CC_ERROR"}, {1u << 19, "ERROR"},
+    };
+    printf(" [R1 %08lX", (unsigned long)e->r1);
+    for (unsigned i = 0; i < sizeof(r1b) / sizeof(r1b[0]); i++)
+      if (e->r1 & r1b[i].bit) printf(" %s", r1b[i].name);
+    printf("]");
+  }
+  static const char* const states[] = {"idle", "ready", "ident", "stby", "tran", "data", "rcv", "prg", "dis"};
+  if (e->card_state < 9) printf(" then %s", states[e->card_state]);
+  else if (e->card_state == 0xFF) printf(" then no answer to CMD13");
+}
+
+// ----- Bad sectors ----------------------------------------------------------
+//
+// A card with failing media is read the way ddrescue reads one: a failed
+// multi-block read is split down to single blocks so the good sectors around
+// a bad one are still read, and after a run of failures the reader skips
+// ahead, doubling the jump each time, so a large dead region costs seconds
+// rather than hours (each failed read waits out a ~250 ms data timeout).
+// Everything not read is accounted for: confirmed-bad sectors and skipped
+// ones are listed separately.
+
+#define MAX_RANGES     48   // ranges kept for the report; totals are exact
+#define DETAIL_ERRORS  8    // failures printed in full before going quiet
+#define SKIP_MIN       64
+#define SKIP_MAX       65536  // 32 MiB
+#define DEAD_RUN       8      // bad blocks in a row that mark a dead region
+
+typedef struct {
+  uint32_t start, len;
+} range_t;
+
+static range_t bad[MAX_RANGES], skipped[MAX_RANGES];
+static uint32_t n_bad, n_skipped;              // ranges recorded (capped)
+static uint32_t bad_ranges, skipped_ranges;    // ranges found (exact)
+static uint64_t bad_sectors, skipped_sectors;  // sectors (exact)
+// Skip window [skip_from, skip_until). It only ever lies ahead of the read
+// that opened it, and each pass (and each file) starts with it closed: a
+// window left open at the end of the card once swallowed every later read
+// at a lower address.
+static uint32_t skip_from, skip_until, skip_len = SKIP_MIN;
+
+static void reset_skip(void) {
+  skip_from = skip_until = 0;
+  skip_len = SKIP_MIN;
+}
+
+static void note_range(range_t* list, uint32_t* n, uint32_t* total, uint32_t lba, uint32_t len) {
+  if (*n && list[*n - 1].start + list[*n - 1].len == lba) {
+    list[*n - 1].len += len;  // extends the previous range
+    return;
+  }
+  (*total)++;
+  if (*n < MAX_RANGES) list[(*n)++] = (range_t){lba, len};
+}
+
+static void note_bad(uint32_t lba, uint32_t len) {
+  bad_sectors += len;
+  note_range(bad, &n_bad, &bad_ranges, lba, len);
+}
+
+static void note_skipped(uint32_t lba, uint32_t len) {
+  skipped_sectors += len;
+  note_range(skipped, &n_skipped, &skipped_ranges, lba, len);
+}
+
 static bool read_sectors(uint32_t lba, uint32_t count, uint8_t* buf) {
   returncode_t rc = sdmmc_read(lba, count, buf);
   if (rc != RETURNCODE_SUCCESS) {
     read_errors++;
-    printf("  ! read of %lu block(s) at LBA %lu failed: %s\r\n",
-           (unsigned long)count, (unsigned long)lba, tock_strrcode(rc));
+    if (read_errors <= DETAIL_ERRORS) {
+      printf("  ! read of %lu block(s) at LBA %lu failed: ", (unsigned long)count, (unsigned long)lba);
+      sdmmc_error_t e;
+      if (sdmmc_error_info(0, &e) == RETURNCODE_SUCCESS) print_error(&e);
+      else printf("%s", tock_strrcode(rc));
+      printf("\r\n");
+      if (read_errors == DETAIL_ERRORS) printf("  ! (further read failures are counted, not listed)\r\n");
+    }
     return false;
   }
   return true;
+}
+
+// Metadata read (boot sector, FAT, directory): one targeted sector, never
+// skipped, recorded as bad if it fails.
+static bool read_meta(uint32_t lba, uint8_t* buf) {
+  if (read_sectors(lba, 1, buf)) return true;
+  note_bad(lba, 1);
+  return false;
+}
+
+// The same, silently: for reads made in the middle of printing a line, which
+// say for themselves that the sector was unreadable.
+static bool read_meta_quiet(uint32_t lba, uint8_t* buf) {
+  if (sdmmc_read(lba, 1, buf) == RETURNCODE_SUCCESS) return true;
+  read_errors++;
+  note_bad(lba, 1);
+  return false;
+}
+
+// Read up to 64 sectors for scanning, ddrescue-style. Sets bit i of *ok for
+// each sector read; returns how many were. Sectors not read are recorded as
+// bad (tried and failed) or skipped (not tried).
+static uint32_t read_resilient(uint32_t lba, uint32_t count, uint8_t* buf, uint64_t* ok) {
+  *ok = 0;
+  if (lba >= skip_from && lba < skip_until) {
+    uint32_t s = skip_until - lba < count ? skip_until - lba : count;
+    note_skipped(lba, s);
+    if (s == count) return 0;
+    uint64_t rest;
+    uint32_t good = read_resilient(lba + s, count - s, buf + 512 * s, &rest);
+    *ok = rest << s;
+    return good;
+  }
+  if (sdmmc_read(lba, count, buf) == RETURNCODE_SUCCESS) {
+    *ok = count == 64 ? ~0ull : ((1ull << count) - 1);
+    skip_len = SKIP_MIN;
+    return count;
+  }
+  read_errors++;
+  // Narrow it down a block at a time. A good block costs well under a
+  // millisecond and a bad one a full data timeout, so reading singles
+  // straight away is cheaper than an intermediate split, which only adds a
+  // failed read for every bad block. Only a run of DEAD_RUN bad blocks in a
+  // row -- a dead region, not scattered damage -- gives up on the rest.
+  // (Giving up after two once reported a photo with 1% bad blocks as 40%
+  // unreadable: the skipped sectors around scattered bad ones were good.)
+  uint32_t good = 0, run_bad = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    if (run_bad >= DEAD_RUN) {
+      note_skipped(lba + i, count - i);
+      break;
+    }
+    if (read_sectors(lba + i, 1, buf + 512 * i)) {
+      *ok |= 1ull << i;
+      good++;
+      run_bad = 0;
+    } else {
+      note_bad(lba + i, 1);
+      run_bad++;
+    }
+  }
+  if (good == 0) {
+    // A dead extent: jump ahead, further each time it happens in a row.
+    skip_from = lba + count;
+    skip_until = skip_from + skip_len;
+    if (skip_len < SKIP_MAX) skip_len *= 2;
+  } else {
+    skip_len = SKIP_MIN;
+  }
+  return good;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +284,10 @@ static void print_sd_status(const sdmmc_info_t* ci) {
   const uint8_t* s = ci->ssr;
   printf("\r\nSD Status (ACMD13)\r\n");
   if (!ci->ssr_valid) {
-    printf("  not read\r\n");
+    sdmmc_error_t e;
+    printf("  not read: ");
+    if (sdmmc_error_info(1, &e) == RETURNCODE_SUCCESS) print_error(&e);
+    printf("\r\n");
     return;
   }
   hex("SSR", s, 32);
@@ -172,7 +334,8 @@ static void print_switch(const sdmmc_info_t* ci) {
   const uint8_t* s = ci->switch_status;
   printf("\r\nCMD6 check (supported functions)\r\n");
   if (!ci->switch_valid) {
-    printf("  not read (no command class 10)\r\n");
+    uint32_t ccc = bits(ci->csd, 16, 95, 84);
+    printf("  not read%s\r\n", ccc & (1u << 10) ? " (the command failed)" : " (no command class 10)");
     return;
   }
   hex("SWITCH", s, 32);
@@ -274,6 +437,9 @@ static void print_card(const sdmmc_info_t* ci) {
          "standard capacity (byte addressed)");
   printf("  Physical layer    %s\r\n", ci->version2 ? "2.00 or later (answered CMD8)" : "1.x");
   printf("  Bus               %u-bit at %lu kHz\r\n", ci->bus_width, (unsigned long)(ci->clock_hz / 1000));
+  if (ci->bus_fallback)
+    printf("  !! 4-bit transfers failed and 1-bit ones work: DAT1-3 are not making contact\r\n"
+           "     (card pads or holder). Running at 1 bit, a quarter of the speed.\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -425,10 +591,22 @@ static fs_t fs;
 static uint8_t fat_cache[512];
 static uint32_t fat_cache_lba = 0xFFFFFFFF;
 
+static uint32_t fat_backup_reads, fat_unreadable;
+
+// A FAT sector, from the first copy or -- if that sector is bad -- the next.
+// FAT keeps every copy identical, which is exactly what makes this safe.
 static int fat_byte(uint32_t off) {
   uint32_t lba = fs.fat_lba + off / 512;
   if (lba != fat_cache_lba) {
-    if (!read_sectors(lba, 1, fat_cache)) return -1;
+    bool got = read_meta(lba, fat_cache);
+    for (uint8_t copy = 1; !got && copy < fs.nfats; copy++) {
+      got = read_meta(lba + copy * fs.fat_sectors, fat_cache);
+      if (got) fat_backup_reads++;
+    }
+    if (!got) {
+      fat_unreadable++;
+      return -1;
+    }
     fat_cache_lba = lba;
   }
   return fat_cache[off % 512];
@@ -514,7 +692,24 @@ static bool parse_bpb(const uint8_t* s, uint32_t lba) {
 
 static bool find_fs(void) {
   static uint8_t s[512];
-  if (!read_sectors(0, 1, s)) return false;
+  if (!read_meta(0, s)) {
+    // No MBR to say where the partition is. Formatters put it at a few
+    // conventional places, and FAT32 keeps a backup boot sector 6 sectors
+    // in, so try those before giving up on the file system.
+    printf("  sector 0 unreadable -- trying the usual partition starts\r\n");
+    static const uint32_t starts[] = {8192, 2048, 63, 32, 16, 1};
+    for (unsigned i = 0; i < sizeof(starts) / sizeof(starts[0]); i++) {
+      for (uint32_t backup = 0; backup <= 6; backup += 6) {
+        if (read_meta(starts[i] + backup, s) && parse_bpb(s, starts[i])) {
+          part_table = "unreadable";
+          printf("  found a %sboot sector for a partition at LBA %lu\r\n", backup ? "backup " : "",
+                 (unsigned long)starts[i]);
+          return true;
+        }
+      }
+    }
+    return false;
+  }
   printf("\r\n=== Partitioning ===\r\n");
   if (s[510] != 0x55 || s[511] != 0xAA) {
     part_table = "none";
@@ -559,7 +754,7 @@ static bool find_fs(void) {
     printf("  no FAT partition found\r\n");
     return false;
   }
-  if (!read_sectors(candidate, 1, s)) return false;
+  if (!read_meta(candidate, s) && !read_meta(candidate + 6, s)) return false;  // +6: FAT32 backup
   if (!memcmp(s + 3, "EXFAT   ", 8)) {
     exfat_seen = true;
     printf("  partition is exFAT -- directory parsing not supported, raw carving only\r\n");
@@ -719,7 +914,7 @@ static void print_class(cls_t c) {
 // file's last cluster beyond its end -- keeps whatever the cluster held
 // before, which is often the start of a deleted file whose first clusters
 // were reused.
-#define MAX_SLACK_FILES 64
+#define MAX_SLACK_FILES 1024
 static struct {
   uint32_t cluster;
   uint32_t size;
@@ -732,9 +927,7 @@ static uint64_t live_bytes;
 // (volume GUIDs, settings) that say something about the card's history.
 #define MAX_DUMP_BYTES 256
 
-static void dump_file_start(uint32_t cl, uint32_t size) {
-  static uint8_t s[512];
-  if (!read_sectors(cluster_lba(cl), 1, s)) return;
+static void dump_bytes(const uint8_t* s, uint32_t size) {
   for (uint32_t off = 0; off < size; off += 16) {
     printf("           %04lX  ", (unsigned long)off);
     for (uint32_t i = 0; i < 16; i++) {
@@ -750,22 +943,26 @@ static void dump_file_start(uint32_t cl, uint32_t size) {
   }
 }
 
-static void describe_cluster(uint32_t cl) {
-  static uint8_t s[512];
-  if (!cluster_valid(cl)) {
-    printf("start cluster out of range");
-    return;
-  }
-  if (!read_sectors(cluster_lba(cl), 1, s)) {
-    printf("unreadable");
-    return;
-  }
+static void describe_sector(const uint8_t* s) {
   const sig_t* sig = identify(s);
   if (sig) printf("%s", sig_label);
   else {
     sec_kind_t k = sector_kind(s);
     printf("%s", k == SEC_ZERO ? "zeros" : k == SEC_FF ? "0xFF fill" : "data, no known header");
   }
+}
+
+static void describe_cluster(uint32_t cl) {
+  static uint8_t s[512];
+  if (!cluster_valid(cl)) {
+    printf("start cluster out of range");
+    return;
+  }
+  if (!read_meta_quiet(cluster_lba(cl), s)) {
+    printf("unreadable");
+    return;
+  }
+  describe_sector(s);
 }
 
 static void print_date(const uint8_t* d) {
@@ -775,6 +972,67 @@ static void print_date(const uint8_t* d) {
     return;
   }
   printf("%04u-%02u-%02u %02u:%02u", 1980 + (dt >> 9), (dt >> 5) & 15, dt & 31, t >> 11, (t >> 5) & 63);
+}
+
+// Largest read the app asks for. The card pays milliseconds of access
+// latency per read command, so big reads are what make a full pass fast.
+#define CARVE_MAX_BLOCKS 64
+static uint8_t carve_buf[CARVE_MAX_BLOCKS * 512] __attribute__((aligned(4)));
+
+static uint32_t carve_blocks(void) {
+  uint32_t max = sdmmc_max_blocks();
+  return max > CARVE_MAX_BLOCKS ? CARVE_MAX_BLOCKS : max ? max : 1;
+}
+
+// ----- Live-file check -------------------------------------------------------
+//
+// Every live file is read end to end through its cluster chain. That is the
+// only way to know whether the user's data is intact -- the free-space pass
+// never touches it -- and it says which files are damaged, which is what
+// matters to whoever owns the card.
+
+static uint32_t n_files_checked, n_files_damaged;
+static uint64_t file_sectors, file_sectors_unread, file_sectors_bad;
+static uint8_t first_sector[512] __attribute__((aligned(4)));
+static bool first_sector_ok;
+static uint32_t file_bad;  // of the last verify_file: tried and failed (the rest of its unread were skipped)
+
+// Read a file's chain. Returns sectors that could not be read: bad, skipped
+// next to bad ones, or beyond a broken chain. Leaves its first sector in
+// `first_sector` (valid if `first_sector_ok`).
+static uint32_t verify_file(uint32_t cl, uint32_t size) {
+  uint32_t need = (size + 511) / 512, remaining = need, guard = 0;
+  uint32_t max = carve_blocks();
+  uint64_t lost0 = bad_sectors + skipped_sectors, bad0 = bad_sectors;
+  first_sector_ok = false;
+  reset_skip();
+  while (remaining && cluster_valid(cl) && guard++ <= fs.clusters) {
+    uint32_t n = remaining < fs.spc ? remaining : fs.spc;
+    uint32_t lba = cluster_lba(cl);
+    for (uint32_t off = 0; off < n; off += max) {
+      uint32_t k = n - off < max ? n - off : max;
+      uint64_t ok;
+      read_resilient(lba + off, k, carve_buf, &ok);
+      if (remaining == need && off == 0 && (ok & 1)) {
+        memcpy(first_sector, carve_buf, 512);
+        first_sector_ok = true;
+      }
+    }
+    remaining -= n;
+    if (!remaining) break;
+    uint32_t next = fat_get(cl);
+    if (next == 0xFFFFFFFF || fat_is_eoc(next) || !cluster_valid(next)) break;  // chain broken
+    cl = next;
+  }
+  uint32_t unread = (uint32_t)(bad_sectors + skipped_sectors - lost0) + remaining;
+  file_bad = (uint32_t)(bad_sectors - bad0);
+  n_files_checked++;
+  file_sectors += need;
+  file_sectors_unread += unread;
+  file_sectors_bad += file_bad;
+  if (unread) n_files_damaged++;
+  reset_skip();
+  return unread;
 }
 
 static void walk_dir(uint32_t cluster, int depth, bool in_deleted, const char* path, cls_t cls);
@@ -874,13 +1132,23 @@ static void dir_entry(const uint8_t* d, const char* lfn, int depth, bool in_dele
       n_slack_files++;
     }
     if (size && cluster_valid(cl)) {
+      uint32_t need = (size + 511) / 512;
+      uint32_t unread = verify_file(cl, size);
       printf("           starts at cluster %lu: ", (unsigned long)cl);
-      describe_cluster(cl);
-      printf("\r\n");
-      if (size <= MAX_DUMP_BYTES) dump_file_start(cl, size);
+      if (first_sector_ok) describe_sector(first_sector);
+      else printf("unreadable");
+      if (unread)
+        printf("; DAMAGED: %lu of %lu sectors not read (%lu bad, %lu skipped next to bad)\r\n",
+               (unsigned long)unread, (unsigned long)need, (unsigned long)file_bad,
+               (unsigned long)(unread - file_bad));
+      else
+        printf("; all %lu sectors read\r\n", (unsigned long)need);
+      if (size <= MAX_DUMP_BYTES && first_sector_ok) dump_bytes(first_sector, size);
     }
   }
 }
+
+static uint32_t dir_sectors_unreadable;
 
 // Walk a directory. `cluster` 0 means the FAT12/16 fixed root. A deleted
 // directory's chain was freed with it, so only its first cluster is read.
@@ -895,7 +1163,14 @@ static void walk_dir(uint32_t cluster, int depth, bool in_deleted, const char* p
     uint32_t first = fixed_root ? fs.root_lba : cluster_lba(cluster);
     uint32_t count = fixed_root ? fs.root_sectors : fs.spc;
     for (uint32_t i = 0; i < count; i++) {
-      if (read_errors > MAX_READ_ERRORS || !read_sectors(first + i, 1, s)) return;
+      if (!read_meta(first + i, s)) {
+        // Lose this sector's 16 entries, not the rest of the directory.
+        dir_sectors_unreadable++;
+        printf("  ! %s: directory sector at LBA %lu unreadable, its 16 entries unknown\r\n", path,
+               (unsigned long)(first + i));
+        lfn[0] = 0;
+        continue;
+      }
       for (int e = 0; e < 16; e++) {
         const uint8_t* d = s + 32 * e;
         if (d[0] == 0x00) return;  // end of directory
@@ -1016,34 +1291,28 @@ static void carve_sector(const uint8_t* s, uint32_t lba, bool cluster_start) {
 static void progress(uint32_t done, uint32_t total, uint32_t t0, uint64_t sectors_read) {
   uint32_t ms = now_ms() - t0;
   uint32_t kbps = ms ? (uint32_t)(sectors_read * 512 / ms) : 0;  // bytes/ms == kB/s
-  printf("  .. %3lu%%  %lu s  %lu kB/s\r\n", (unsigned long)((uint64_t)done * 100 / total),
+  printf("  .. %3lu%%  %lu s  %lu kB/s", (unsigned long)((uint64_t)done * 100 / total),
          (unsigned long)(ms / 1000), (unsigned long)kbps);
+  if (bad_sectors || skipped_sectors)
+    printf("  bad %lu, skipped %lu", (unsigned long)bad_sectors, (unsigned long)skipped_sectors);
+  printf("\r\n");
 }
 
-// Largest read the app asks for. The card pays milliseconds of access
-// latency per read command, so big reads are what make a full pass fast.
-#define CARVE_MAX_BLOCKS 64
-static uint8_t carve_buf[CARVE_MAX_BLOCKS * 512] __attribute__((aligned(4)));
 static uint32_t carve_kBps;  // throughput of the carving pass, for the record
+static uint32_t clusters_unknown;  // FAT entry unreadable in every copy
 
-static uint32_t carve_blocks(void) {
-  uint32_t max = sdmmc_max_blocks();
-  return max > CARVE_MAX_BLOCKS ? CARVE_MAX_BLOCKS : max ? max : 1;
-}
-
-// Carve `count` contiguous sectors from `lba`. Returns sectors read.
+// Carve `count` contiguous sectors from `lba`. Returns sectors read. A sector
+// that could not be read ends any run, as a gap in the data does.
 static uint32_t carve_extent(uint32_t lba, uint32_t count, uint32_t max) {
   uint32_t got = 0;
   for (uint32_t off = 0; off < count; off += max) {
     uint32_t n = count - off < max ? count - off : max;
-    if (!read_sectors(lba + off, n, carve_buf)) {
-      end_run();
-      continue;
-    }
-    got += n;
+    uint64_t ok;
+    got += read_resilient(lba + off, n, carve_buf, &ok);
     for (uint32_t i = 0; i < n; i++) {
       uint32_t s = lba + off + i;
-      carve_sector(carve_buf + 512 * i, s, (s - fs.data_lba) % fs.spc == 0);
+      if (ok & (1ull << i)) carve_sector(carve_buf + 512 * i, s, (s - fs.data_lba) % fs.spc == 0);
+      else end_run();
     }
   }
   return got;
@@ -1052,6 +1321,7 @@ static uint32_t carve_extent(uint32_t lba, uint32_t count, uint32_t max) {
 // Read every sector of every free cluster, merging runs of adjacent free
 // clusters into single reads.
 static void carve_free_space(void) {
+  reset_skip();
   uint32_t max = carve_blocks();
   uint32_t per_read = max / fs.spc ? max / fs.spc : 1;  // clusters per read
   uint32_t t0 = now_ms();
@@ -1065,12 +1335,12 @@ static void carve_free_space(void) {
       progress(cl - 2, fs.clusters, t0, sectors_read);
       next += step;
     }
-    if (read_errors > MAX_READ_ERRORS) {
-      printf("  too many read errors, stopping\r\n");
-      break;
-    }
-    if (fat_get(cl) != 0) {
-      end_run();  // allocated (or unreadable FAT) breaks a run
+    uint32_t entry = fat_get(cl);
+    if (entry != 0) {
+      // Allocated -- or its FAT entry unreadable in every copy, in which
+      // case whether it is free is unknown, and it is left alone.
+      if (entry == 0xFFFFFFFF) clusters_unknown++;
+      end_run();
       cl++;
       continue;
     }
@@ -1097,6 +1367,7 @@ static void carve_free_space(void) {
 static void carve_slack_and_gaps(uint32_t card_blocks) {
   uint32_t max = carve_blocks();
   uint32_t before = n_headers;
+  reset_skip();
 
   printf("\r\n=== File slack (%lu live files) ===\r\n", (unsigned long)n_slack_files);
   uint32_t slack_sectors = 0;
@@ -1113,6 +1384,7 @@ static void carve_slack_and_gaps(uint32_t card_blocks) {
     uint32_t used = size ? ((size - 1) % cluster_bytes) / 512 + 1 : 0;  // sectors holding file data
     if (used >= fs.spc) continue;
     end_run();
+    reset_skip();  // each file's slack is its own pass
     slack_sectors += carve_extent(cluster_lba(cl) + used, fs.spc - used, max);
     end_run();
   }
@@ -1120,6 +1392,7 @@ static void carve_slack_and_gaps(uint32_t card_blocks) {
          (unsigned long)(n_headers - before));
 
   before = n_headers;
+  reset_skip();
   uint32_t vol_end = fs.part_lba + fs.total_sectors;
   printf("\r\n=== Outside the partition ===\r\n");
   if (fs.part_lba > 1) printf("  before: LBA 1-%lu\r\n", (unsigned long)(fs.part_lba - 1));
@@ -1132,6 +1405,95 @@ static void carve_slack_and_gaps(uint32_t card_blocks) {
   printf("  %lu sectors carved, %lu header(s)\r\n", (unsigned long)gap, (unsigned long)(n_headers - before));
 }
 
+// ---------------------------------------------------------------------------
+// Probe: is it the media or the bus?
+// ---------------------------------------------------------------------------
+//
+// Single-block reads spread across the card, under several bus settings. A
+// region of bad media fails at the same addresses whatever the bus does; a
+// bus problem (a poor contact on DAT1-3, marginal signal at 25 MHz) fails
+// everywhere at one setting and works at another. The best setting found is
+// left in place for the rest of the run.
+
+#define FAST_TIMEOUT_MS 25
+static uint32_t data_timeout_ms = 100;  // in force for the scan, for the report
+
+#define PROBE_CONFIGS 4
+static const struct { uint32_t width, hz; } probe_cfg[PROBE_CONFIGS] = {
+  {4, 25000000}, {4, 10000000}, {1, 25000000}, {1, 5000000},
+};
+
+static void probe(uint32_t blocks) {
+  uint32_t lbas[] = {0, 1, 64, 2048, 8192, 65536, blocks / 8, blocks / 4, blocks / 2, blocks / 4 * 3, blocks - 1};
+  const int n = sizeof(lbas) / sizeof(lbas[0]);
+  int ok[PROBE_CONFIGS] = {0};
+  sdmmc_error_t first_err[PROBE_CONFIGS];
+  bool have_err[PROBE_CONFIGS] = {false};
+  char cell[PROBE_CONFIGS][sizeof(lbas) / sizeof(lbas[0])][12];
+
+  printf("\r\n=== Probe: single-block reads across the card ===\r\n");
+  for (int c = 0; c < PROBE_CONFIGS; c++) {
+    uint32_t actual = 0;
+    if (sdmmc_set_bus(probe_cfg[c].width, probe_cfg[c].hz, &actual) != RETURNCODE_SUCCESS) {
+      for (int i = 0; i < n; i++) snprintf(cell[c][i], sizeof(cell[c][i]), "no bus");
+      continue;
+    }
+    for (int i = 0; i < n; i++) {
+      uint32_t t0 = now_ms();
+      returncode_t rc = sdmmc_read(lbas[i], 1, carve_buf);
+      uint32_t ms = now_ms() - t0;
+      if (rc == RETURNCODE_SUCCESS) {
+        ok[c]++;
+        snprintf(cell[c][i], sizeof(cell[c][i]), "ok %lums", (unsigned long)ms);
+      } else {
+        sdmmc_error_t e;
+        static const char* const st[] = {"?", "resp", "status", "data", "busy", "stuck"};
+        bool got = sdmmc_error_info(0, &e) == RETURNCODE_SUCCESS;
+        if (got && !have_err[c]) {
+          first_err[c] = e;
+          have_err[c] = true;
+        }
+        snprintf(cell[c][i], sizeof(cell[c][i]), "FAIL %s", got && e.stage < 6 ? st[e.stage] : "?");
+      }
+    }
+  }
+
+  printf("  %10s", "LBA");
+  for (int c = 0; c < PROBE_CONFIGS; c++)
+    printf("  %lu-bit %2lu MHz", (unsigned long)probe_cfg[c].width, (unsigned long)(probe_cfg[c].hz / 1000000));
+  printf("\r\n");
+  for (int i = 0; i < n; i++) {
+    printf("  %10lu", (unsigned long)lbas[i]);
+    for (int c = 0; c < PROBE_CONFIGS; c++) printf("  %-13s", cell[c][i]);
+    printf("\r\n");
+  }
+  int best = 0;
+  for (int c = 0; c < PROBE_CONFIGS; c++) {
+    printf("  %lu-bit %2lu MHz: %d/%d read", (unsigned long)probe_cfg[c].width,
+           (unsigned long)(probe_cfg[c].hz / 1000000), ok[c], n);
+    if (have_err[c]) {
+      printf("; first failure ");
+      print_error(&first_err[c]);
+    }
+    printf("\r\n");
+    if (ok[c] > ok[best]) best = c;  // ties keep the faster, earlier setting
+  }
+  uint32_t actual = 0;
+  sdmmc_set_bus(probe_cfg[best].width, probe_cfg[best].hz, &actual);
+  printf("  continuing at %lu-bit, %lu kHz\r\n", (unsigned long)probe_cfg[best].width,
+         (unsigned long)(actual / 1000));
+
+  // Bad blocks even at the best setting: every one will cost a full data
+  // timeout. On failing media they never answer at all, while good blocks
+  // answer in a few ms, so waiting the specification's 100 ms is nearly all
+  // waste. Shorten it, and say so -- a block slower than this but good would
+  // be counted bad.
+  if (ok[best] < n && sdmmc_set_timeout(FAST_TIMEOUT_MS) == RETURNCODE_SUCCESS) {
+    data_timeout_ms = FAST_TIMEOUT_MS;
+    printf("  bad blocks present: data timeout shortened to %u ms for the scan\r\n", FAST_TIMEOUT_MS);
+  }
+}
+
 static uint32_t bench_multi_kBps, bench_single_kBps;
 
 // Raw read speed: the same 4 MiB at the start of the card, once with the
@@ -1139,13 +1501,20 @@ static uint32_t bench_multi_kBps, bench_single_kBps;
 // so this is the driver plus the card, without the carving loop.
 static void benchmark(uint32_t blocks) {
   const uint32_t total = 8192;  // blocks = 4 MiB
-  if (blocks < total) return;
-  printf("\r\n=== Read speed (4 MiB from LBA 0, no processing) ===\r\n");
+  if (blocks < 2 * total) return;
+  // Mid-card rather than at LBA 0: failing cards tend to fail at the front,
+  // where the file system's busiest sectors are, and a speed measured across
+  // bad blocks says nothing about the card.
+  uint32_t base = (blocks / 2) & ~63u;
+  printf("\r\n=== Read speed (4 MiB from LBA %lu, no processing) ===\r\n", (unsigned long)base);
   uint32_t sizes[2] = {carve_blocks(), 1};
   for (int k = 0; k < 2; k++) {
     uint32_t n = sizes[k], t0 = now_ms();
-    for (uint32_t lba = 0; lba < total; lba += n) {
-      if (!read_sectors(lba, n, carve_buf)) return;
+    for (uint32_t lba = base; lba < base + total; lba += n) {
+      if (!read_sectors(lba, n, carve_buf)) {
+        printf("  read failed inside the benchmark region; speed not measured\r\n");
+        return;
+      }
     }
     uint32_t ms = now_ms() - t0;
     uint32_t kbps = ms ? (uint32_t)((uint64_t)total * 512 / ms) : 0;
@@ -1157,25 +1526,75 @@ static void benchmark(uint32_t blocks) {
 
 // No usable file system: scan the whole card.
 static void carve_raw(uint32_t blocks) {
+  reset_skip();
   uint32_t max = carve_blocks();
   uint32_t t0 = now_ms();
   uint32_t step = blocks / 10 + 1, next = step;
   printf("\r\n=== Raw carving (every sector of the card) ===\r\n");
-  for (uint32_t lba = 0; lba < blocks && read_errors <= MAX_READ_ERRORS; lba += max) {
+  for (uint32_t lba = 0; lba < blocks; lba += max) {
     uint32_t n = blocks - lba < max ? blocks - lba : max;
     if (lba >= next) {
       progress(lba, blocks, t0, lba);
       next += step;
     }
-    if (!read_sectors(lba, n, carve_buf)) {
-      end_run();
-      continue;
+    uint64_t ok;
+    read_resilient(lba, n, carve_buf, &ok);
+    for (uint32_t i = 0; i < n; i++) {
+      if (ok & (1ull << i)) carve_sector(carve_buf + 512 * i, lba + i, (lba + i) % 8 == 0);
+      else end_run();
     }
-    for (uint32_t i = 0; i < n; i++) carve_sector(carve_buf + 512 * i, lba + i, (lba + i) % 8 == 0);
   }
   end_run();
   uint32_t ms = now_ms() - t0;
   carve_kBps = ms ? (uint32_t)((uint64_t)blocks * 512 / ms) : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Media health report
+// ---------------------------------------------------------------------------
+
+static void print_ranges(const char* what, const range_t* list, uint32_t n, uint32_t total) {
+  if (!n) return;
+  printf("  %s ranges (LBA, sectors):", what);
+  for (uint32_t i = 0; i < n; i++) {
+    if (i % 4 == 0) printf("\r\n   ");
+    printf("  %lu+%lu", (unsigned long)list[i].start, (unsigned long)list[i].len);
+  }
+  if (total > n) printf("\r\n    ... and %lu more", (unsigned long)(total - n));
+  printf("\r\n");
+}
+
+static void print_media(const sdmmc_info_t* ci) {
+  printf("\r\n=== Media ===\r\n");
+  if (ci && ci->bus_fallback) printf("  Bus               fell back to 1-bit: DAT1-3 not working\r\n");
+  else if (ci) printf("  Bus               %u-bit, no fallback needed\r\n", ci->bus_width);
+  printf("  Data timeout      %lu ms%s\r\n", (unsigned long)data_timeout_ms,
+         data_timeout_ms < 100 ? " (shortened: a good block slower than this would count as bad)" : "");
+  printf("  Bad sectors       %lu (%lu MiB) in %lu range%s -- tried and failed\r\n", (unsigned long)bad_sectors,
+         (unsigned long)(bad_sectors / 2048), (unsigned long)bad_ranges, bad_ranges == 1 ? "" : "s");
+  printf("  Skipped sectors   %lu (%lu MiB) in %lu range%s -- not tried, next to bad ones\r\n",
+         (unsigned long)skipped_sectors, (unsigned long)(skipped_sectors / 2048), (unsigned long)skipped_ranges,
+         skipped_ranges == 1 ? "" : "s");
+  if (fat_backup_reads || fat_unreadable)
+    printf("  FAT               %lu sector(s) read from a backup copy, %lu unreadable in every copy\r\n",
+           (unsigned long)fat_backup_reads, (unsigned long)fat_unreadable);
+  if (dir_sectors_unreadable)
+    printf("  Directories       %lu sector(s) unreadable (16 entries each unknown)\r\n",
+           (unsigned long)dir_sectors_unreadable);
+  if (clusters_unknown)
+    printf("  Clusters          %lu of unknown state (FAT entry unreadable), not scanned\r\n",
+           (unsigned long)clusters_unknown);
+  print_ranges("Bad", bad, n_bad, bad_ranges);
+  print_ranges("Skipped", skipped, n_skipped, skipped_ranges);
+  if (n_files_checked)
+    printf("  Live file data    %lu file(s) read end to end, %lu damaged: %lu of %lu sectors not read\r\n"
+           "                    (%lu bad, %lu skipped next to bad)\r\n",
+           (unsigned long)n_files_checked, (unsigned long)n_files_damaged, (unsigned long)file_sectors_unread,
+           (unsigned long)file_sectors, (unsigned long)file_sectors_bad,
+           (unsigned long)(file_sectors_unread - file_sectors_bad));
+  printf("  Coverage: every live file's data, free space, file slack, the sectors\r\n"
+         "  outside the partition, and the file-system metadata walked. Not read:\r\n"
+         "  reserved sectors and FAT sectors never consulted.\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,7 +1608,7 @@ static void carve_raw(uint32_t blocks) {
 // left to the host to keep private.
 
 #define SDREC_SCHEMA 2  // 2: entries classified (user / OS artifact / trash), tagged verdict
-#define SD_INSPECT_VERSION "1.3"
+#define SD_INSPECT_VERSION "1.4"
 
 static void json_hex(const char* key, const uint8_t* p, int n) {
   printf("\"%s\":\"", key);
@@ -1306,7 +1725,34 @@ static void emit_record(const sdmmc_info_t* ci, bool have_info, bool have_fs, bo
   printf("\"deleted_user\":%lu,\"deleted_os\":%lu,", (unsigned long)n_del_user, (unsigned long)n_del_os);
   printf("\"carved_headers\":%lu,\"carved_video\":%lu,\"residual_kib\":%lu,", (unsigned long)n_headers,
          (unsigned long)n_video_headers, (unsigned long)(residual_sectors / 2));
-  printf("\"read_errors\":%lu}}\r\n", (unsigned long)read_errors);
+  printf("\"read_errors\":%lu},", (unsigned long)read_errors);
+  RECORD_FLUSH();
+
+  // Media health, separate from what the card holds. Range lists are capped
+  // to keep the line bounded; the totals are exact.
+  printf("\"media\":{\"bus_fallback\":%s,\"timeout_ms\":%lu,\"bad_sectors\":%lu,\"bad_ranges\":%lu,"
+         "\"skipped_sectors\":%lu,\"skipped_ranges\":%lu,",
+         have_info && ci->bus_fallback ? "true" : "false", (unsigned long)data_timeout_ms,
+         (unsigned long)bad_sectors, (unsigned long)bad_ranges, (unsigned long)skipped_sectors,
+         (unsigned long)skipped_ranges);
+  printf("\"fat_backup_reads\":%lu,\"fat_unreadable\":%lu,\"dir_sectors_unreadable\":%lu,"
+         "\"clusters_unknown\":%lu,", (unsigned long)fat_backup_reads, (unsigned long)fat_unreadable,
+         (unsigned long)dir_sectors_unreadable, (unsigned long)clusters_unknown);
+  printf("\"files_checked\":%lu,\"files_damaged\":%lu,\"file_sectors\":%lu,\"file_sectors_unread\":%lu,"
+         "\"file_sectors_bad\":%lu,",
+         (unsigned long)n_files_checked, (unsigned long)n_files_damaged, (unsigned long)file_sectors,
+         (unsigned long)file_sectors_unread, (unsigned long)file_sectors_bad);
+  RECORD_FLUSH();
+  const uint32_t list_max = 16;
+  printf("\"bad\":[");
+  for (uint32_t i = 0; i < n_bad && i < list_max; i++)
+    printf("%s[%lu,%lu]", i ? "," : "", (unsigned long)bad[i].start, (unsigned long)bad[i].len);
+  printf("],");
+  RECORD_FLUSH();
+  printf("\"skipped\":[");
+  for (uint32_t i = 0; i < n_skipped && i < list_max; i++)
+    printf("%s[%lu,%lu]", i ? "," : "", (unsigned long)skipped[i].start, (unsigned long)skipped[i].len);
+  printf("]}}\r\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,6 +1781,7 @@ int main(void) {
   bool have_info = sdmmc_get_info(&info) == RETURNCODE_SUCCESS;
   if (have_info) print_card(&info);
 
+  probe(blocks);
   benchmark(blocks);
 
   bool have_fs = find_fs();
@@ -1348,6 +1795,8 @@ int main(void) {
   } else {
     carve_raw(blocks);
   }
+
+  print_media(have_info ? &info : NULL);
 
   printf("\r\n=== Summary ===\r\n");
   if (have_fs) {
@@ -1382,6 +1831,9 @@ int main(void) {
   printf("  Read errors:                    %lu\r\n", (unsigned long)read_errors);
   printf("\r\n  Verdict: %s\r\n", verdict());
   if (n_user_files) printf("    user files PRESENT\r\n");
+  if (n_files_damaged)
+    printf("    %lu file(s) DAMAGED -- unreadable sectors in their data\r\n", (unsigned long)n_files_damaged);
+  if (bad_sectors) printf("    media has bad sectors: %lu tried and failed\r\n", (unsigned long)bad_sectors);
   else if (n_os_files || n_os_dirs) printf("    no user files -- only artifacts of the OS that mounted it\r\n");
   else printf("    no files present\r\n");
   if (n_trashed_files) printf("    %lu file(s) in a trash folder: deleted by the user, still intact\r\n",

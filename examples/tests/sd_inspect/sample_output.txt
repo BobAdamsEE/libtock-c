@@ -1,0 +1,96 @@
+##### SD card inspector #####
+Card detect switch: no card (trying anyway)
+Card initialised in 16 ms
+
+=== Card registers ===
+  CID    41343253443531321023880B4B007169
+  CSD    002E01325F5983D8F6DB5FFF9E4000D9
+  SCR    0125000000000000
+  OCR    80FF8000   RCA 0002
+
+CID (card identification)
+  Manufacturer ID   0x41 (Kingston)
+  OEM/application   "42"
+  Product name      "SD512"
+  Product revision  1.0
+  Serial number     0x23880B4B (596118347)
+  Manufactured      2007-01
+  CRC7              0x34, computed 0x34: OK
+
+CSD (card specific data)
+  CSD structure     1 (SDSC)
+  TRAN_SPEED        0x32 (25 MHz)
+  Command classes   0x5F5
+  READ_BL_LEN       512 bytes
+  Capacity          1008640 blocks = 492 MiB (516 MB)
+  Copy flag         0
+  Write protect     permanent=0 temporary=0
+  File format       grp=0 fmt=0
+  CRC7              0x6C, computed 0x6C: OK
+
+SCR (SD configuration)
+  Physical layer    1.10
+  Data after erase  all 0s (0x00)
+  Security          2
+  Bus widths        0x5
+
+OCR / link
+  Capacity status   standard capacity (byte addressed)
+  Physical layer    1.x
+  Bus               4-bit at 25000 kHz
+
+=== Read speed (4 MiB from LBA 0, no processing) ===
+  64 block(s) per read: 603 ms, 6955 kB/s
+   1 block(s) per read: 3511 ms, 1194 kB/s
+
+=== Partitioning ===
+  partition 1: type 0x0E, LBA 231, 1008409 sectors (492 MiB)
+
+=== FAT16 file system at LBA 231 ===
+  OEM name "MSDOS5.0", label "NO NAME    ", type string "FAT16   ", serial 2AF2C38F
+  32 sectors/cluster (16 KiB), 2 FATs of 124 sectors, 31503 clusters
+  FAT at LBA 239, root at LBA 487, data at LBA 519
+
+=== Directory tree (DELETED* = inside a deleted directory) ===
+  state          size  modified          name
+  volume label "KINGSTON   "
+  PRESENT  <DIR>       2025-10-26 12:44  /System Volume Information/
+  PRESENT          12  2025-10-26 12:44  /System Volume Information/WPSettings.dat
+           starts at cluster 3: data, no known header
+  PRESENT          76  2025-10-26 12:44  /System Volume Information/IndexerVolumeGuid
+           starts at cluster 4: data, no known header
+
+=== Free-space carving (every sector of 31503 clusters) ===
+  DATA    no recognised header       LBA      615  6413 KiB
+          first bytes 3B C3 FB 78 43 C3 22 6F 6F 27 3A 12 D8 F0 DC D6  |;..xC."oo':.....|
+  DATA    no recognised header       LBA    13472  96 KiB
+          first bytes 7B 00 31 00 35 00 34 00 32 00 43 00 38 00 42 00  |{.1.5.4.2.C.8.B.|
+  ..  10%  10 s  5046 kB/s
+  ..  20%  20 s  5040 kB/s
+  ..  30%  30 s  5037 kB/s
+  ..  40%  41 s  5035 kB/s
+  ..  50%  51 s  5034 kB/s
+  ..  60%  61 s  5033 kB/s
+  ..  70%  71 s  5033 kB/s
+  ..  80%  82 s  5032 kB/s
+  ..  90%  92 s  5032 kB/s
+  done: 31500 free clusters, 492 MiB read in 102.5 s (5031 kB/s)
+
+=== File slack (2 live files) ===
+  HEADER  AVI (RIFF) 6414 KiB        LBA      608  then 3 KiB of contiguous data
+  62 slack sectors carved, 1 header(s)
+
+=== Outside the partition ===
+  before: LBA 1-230
+  230 sectors carved, 0 header(s)
+
+=== Summary ===
+  Files plainly present:          2 (1 dirs), 88 bytes
+  Deleted directory entries:      0 files, 0 dirs; 0 with data not reused
+  Residual data in unallocated:   6513 KiB in 4 runs
+  File headers found there:       1 (1 video), 0 embedded
+  Read errors:                    0
+
+  Verdict: files PRESENT; DELETED content recoverable:
+    1 file header(s) in unallocated space, 1 of them video (carving, photorec-style)
+##### done #####
