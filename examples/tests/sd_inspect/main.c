@@ -23,7 +23,13 @@
 
 #include "sdmmc.h"
 
-#define MAX_DEPTH        6
+// Folder levels walked below the root. Each level costs ~960 bytes of stack
+// (walk_dir's frame, with dir_entry inlined), so STACK_SIZE in the Makefile
+// has to grow with it. 6 was too few: a Nintendo DSi keeps photos and
+// Flipnotes 6 deep under /private/ds/app/, and they went uncounted.
+// A folder at the limit is still listed, counted in dirs_too_deep and
+// reported -- never silently skipped.
+#define MAX_DEPTH        12
 #define MAX_HEADER_LINES 64
 #define MAX_RAW_RUNS     16
 
@@ -480,6 +486,7 @@ static const sig_t* identify(const uint8_t* s) {
   static const sig_t ID3  = {"MP3 (ID3)", false, true};
   static const sig_t FLAC = {"FLAC", false, true};
   static const sig_t BMP  = {"BMP", false, false};
+  static const sig_t TIFF = {"TIFF/raw (NEF, CR2, DNG)", false, false};
 
   if (!memcmp(s + 4, "ftyp", 4)) {
     snprintf(sig_label, sizeof(sig_label), "%s '%c%c%c%c'", MP4.name, s[8], s[9], s[10], s[11]);
@@ -526,6 +533,8 @@ static const sig_t* identify(const uint8_t* s) {
   else if (!memcmp(s, sz, 6)) r = &SZ;
   else if (!memcmp(s, "ID3", 3) && s[3] < 5) r = &ID3;
   else if (!memcmp(s, "fLaC", 4)) r = &FLAC;
+  else if (!memcmp(s, "II*\0", 4) && le32(s + 4) >= 8 && le32(s + 4) < 512) r = &TIFF;
+  else if (!memcmp(s, "MM\0*\0\0", 6) && s[6] < 2 && (s[6] || s[7] >= 8)) r = &TIFF;
   else if (s[0] == 'B' && s[1] == 'M' && le32(s + 2) > 54 && le32(s + 6) == 0 && le32(s + 14) == 40) r = &BMP;
   if (r) snprintf(sig_label, sizeof(sig_label), "%s", r->name);
   return r;
@@ -921,6 +930,20 @@ static struct {
 } slack_files[MAX_SLACK_FILES];
 static uint32_t n_slack_files;
 static uint64_t live_bytes;
+static uint32_t dirs_too_deep;  // folders listed but not entered (MAX_DEPTH)
+
+// Decimal text of a 64-bit value. %lu is 32 bits here and printf has no
+// %llu, so a card holding more than 4 GiB of live files printed its total
+// modulo 2^32 (card-022: 7.26 GB shown as 2.96 GB).
+static const char* u64_dec(uint64_t v, char buf[21]) {
+  char* p = buf + 20;
+  *p = '\0';
+  do {
+    *--p = (char)('0' + v % 10);
+    v /= 10;
+  } while (v);
+  return p;
+}
 
 // Describe what the first sector of cluster `cl` holds.
 // Small files are shown in full, as hex and ASCII: they are usually metadata
@@ -1094,6 +1117,10 @@ static void dir_entry(const uint8_t* d, const char* lfn, int depth, bool in_dele
       snprintf(sub, sizeof(sub), "%s%s/", path, shown);
       // Inside an Android LOST.DIR, entries are classified as ordinary ones.
       walk_dir(cl, depth + 1, gone, sub, cls.kind == K_OS_SHELL ? CLS_USER : cls);
+    } else if (cluster_valid(cl)) {
+      dirs_too_deep++;
+      printf("           folder %d levels deep: its contents NOT walked (MAX_DEPTH %d)\r\n", depth + 1,
+             MAX_DEPTH);
     }
     return;
   }
@@ -1148,16 +1175,32 @@ static void dir_entry(const uint8_t* d, const char* lfn, int depth, bool in_dele
   }
 }
 
-static uint32_t dir_sectors_unreadable;
+static uint32_t dir_sectors_unreadable, dirs_not_walked;
+
+// Every subdirectory begins with its "." and ".." entries.
+static bool holds_directory(const uint8_t* s) {
+  return !memcmp(s, ".          ", 11) && (s[11] & 0x10) && !memcmp(s + 32, "..         ", 11) &&
+         (s[32 + 11] & 0x10);
+}
 
 // Walk a directory. `cluster` 0 means the FAT12/16 fixed root. A deleted
-// directory's chain was freed with it, so only its first cluster is read.
+// directory's chain was freed with it, so only its first cluster is read --
+// and that cluster may since hold anything, which read as entries gives
+// garbage names and further "directories" to descend into. So a subdirectory
+// is walked only if it starts with "." and "..".
 static void walk_dir(uint32_t cluster, int depth, bool in_deleted, const char* path, cls_t cls) {
   uint8_t s[512];
   char lfn[128];
   lfn[0] = 0;
   uint32_t guard = 0;
   bool fixed_root = cluster == 0;
+
+  if (!fixed_root && depth > 0 && read_meta(cluster_lba(cluster), s) && !holds_directory(s)) {
+    dirs_not_walked++;
+    printf("           cluster %lu holds no directory (no . and .. entries): %s, not walked\r\n",
+           (unsigned long)cluster, in_deleted ? "reused since" : "DAMAGED");
+    return;
+  }
 
   while (fixed_root || cluster_valid(cluster)) {
     uint32_t first = fixed_root ? fs.root_lba : cluster_lba(cluster);
@@ -1224,11 +1267,21 @@ typedef struct {
 } run_t;
 
 static run_t run;
-static uint32_t n_headers, n_video_headers, n_raw_runs, n_raw_printed, n_nested;
+static uint32_t n_headers, n_video_headers, n_runs, n_raw_printed, n_nested;
 static uint64_t residual_sectors;
+
+// Weak signatures by LBA modulo GRID_MAX. Deleted files sit where the format
+// that wrote them put them, and a card reformatted since has a different
+// cluster grid. That older grid is only known once the scan is over, so the
+// sectors are tallied here and judged afterwards.
+#define GRID_MAX 256
+static uint32_t weak_by_residue[GRID_MAX];
+static uint32_t n_weak, n_weak_headers;
+static uint32_t grid_sectors, grid_offset;
 
 static void end_run(void) {
   if (!run.active) return;
+  n_runs++;
   uint32_t kib = run.sectors / 2;
   if (run.labeled) {
     if (n_headers <= MAX_HEADER_LINES) {
@@ -1236,7 +1289,6 @@ static void end_run(void) {
              (unsigned long)run.start_lba, (unsigned long)kib);
     }
   } else {
-    n_raw_runs++;
     if (run.sectors >= 8 && n_raw_printed < MAX_RAW_RUNS) {
       n_raw_printed++;
       printf("  DATA    no recognised header       LBA %8lu  %lu KiB\r\n", (unsigned long)run.start_lba,
@@ -1267,6 +1319,11 @@ static void carve_sector(const uint8_t* s, uint32_t lba, bool cluster_start) {
   // only where a file could start: at a cluster boundary, or after a gap.
   bool new_file = sig && (sig->strong || cluster_start || !run.active);
   if (sig && !new_file) n_nested++;
+  if (sig && !sig->strong) {
+    weak_by_residue[lba % GRID_MAX]++;
+    n_weak++;
+    if (new_file) n_weak_headers++;
+  }
   if (new_file) {
     end_run();
     n_headers++;
@@ -1359,6 +1416,37 @@ static void carve_free_space(void) {
          (unsigned long)(sectors_read / 2048), (unsigned long)(ms / 1000), (unsigned long)(ms % 1000 / 100),
          (unsigned long)(ms ? sectors_read * 512 / ms : 0));
   if (n_headers > MAX_HEADER_LINES) printf("  (%lu more headers not listed)\r\n", (unsigned long)(n_headers - MAX_HEADER_LINES));
+}
+
+// Look for the cluster grid of an earlier format: the largest power of two on
+// which one offset holds at least 3/4 of the weak signatures. Where there is
+// one, signatures on it are file starts whatever the current file system's
+// grid says, and the rest are inside files. The HEADER lines are written during
+// the scan, before this is known, so one can be a marker inside a file, and a
+// file counted here need not have a line of its own.
+static void find_format_grid(void) {
+  for (uint32_t g = GRID_MAX; g >= 8; g /= 2) {
+    uint32_t best = 0, offset = 0;
+    for (uint32_t r = 0; r < g; r++) {
+      uint32_t hits = 0;
+      for (uint32_t i = r; i < GRID_MAX; i += g) hits += weak_by_residue[i];
+      if (hits > best) {
+        best = hits;
+        offset = r;
+      }
+    }
+    if (best < 8 || (uint64_t)best * 4 < (uint64_t)n_weak * 3) continue;
+    if (fs.spc == g && fs.data_lba % g == offset) return;  // the current file system's own
+    grid_sectors = g;
+    grid_offset = offset;
+    n_headers += best - n_weak_headers;
+    n_nested = n_weak - best;
+    printf("\r\n=== Earlier format ===\r\n");
+    printf("  %lu of %lu weak signatures on a %lu-sector grid at offset %lu, not this file system's:\r\n",
+           (unsigned long)best, (unsigned long)n_weak, (unsigned long)g, (unsigned long)offset);
+    printf("  counted as file starts in the summary, the other %lu as inside files\r\n", (unsigned long)n_nested);
+    return;
+  }
 }
 
 // Carve what free-space carving does not cover but photorec's whole-disk
@@ -1595,6 +1683,10 @@ static void print_media(const sdmmc_info_t* ci) {
   printf("  Coverage: every live file's data, free space, file slack, the sectors\r\n"
          "  outside the partition, and the file-system metadata walked. Not read:\r\n"
          "  reserved sectors and FAT sectors never consulted.\r\n");
+  if (dirs_too_deep)
+    printf("  INCOMPLETE: %lu folder(s) deeper than %d levels were not entered; their\r\n"
+           "  files are missing from the counts above and were not read.\r\n",
+           (unsigned long)dirs_too_deep, MAX_DEPTH);
 }
 
 // ---------------------------------------------------------------------------
@@ -1608,7 +1700,7 @@ static void print_media(const sdmmc_info_t* ci) {
 // left to the host to keep private.
 
 #define SDREC_SCHEMA 2  // 2: entries classified (user / OS artifact / trash), tagged verdict
-#define SD_INSPECT_VERSION "1.4"
+#define SD_INSPECT_VERSION "1.6"
 
 static void json_hex(const char* key, const uint8_t* p, int n) {
   printf("\"%s\":\"", key);
@@ -1718,13 +1810,17 @@ static void emit_record(const sdmmc_info_t* ci, bool have_info, bool have_fs, bo
   printf("\"trashed_files\":%lu,\"trashed_dirs\":%lu,", (unsigned long)n_trashed_files,
          (unsigned long)n_trashed_dirs);
   RECORD_FLUSH();
-  printf("\"present_files\":%lu,\"present_dirs\":%lu,\"present_bytes\":%lu,", (unsigned long)n_live_files,
-         (unsigned long)n_live_dirs, (unsigned long)live_bytes);
+  char live_dec[21];
+  printf("\"present_files\":%lu,\"present_dirs\":%lu,\"present_bytes\":%s,", (unsigned long)n_live_files,
+         (unsigned long)n_live_dirs, u64_dec(live_bytes, live_dec));
+  printf("\"max_depth\":%d,\"dirs_too_deep\":%lu,\"dirs_not_walked\":%lu,", MAX_DEPTH,
+         (unsigned long)dirs_too_deep, (unsigned long)dirs_not_walked);
   printf("\"deleted_files\":%lu,\"deleted_dirs\":%lu,\"deleted_intact\":%lu,", (unsigned long)n_del_files,
          (unsigned long)n_del_dirs, (unsigned long)n_del_intact);
   printf("\"deleted_user\":%lu,\"deleted_os\":%lu,", (unsigned long)n_del_user, (unsigned long)n_del_os);
   printf("\"carved_headers\":%lu,\"carved_video\":%lu,\"residual_kib\":%lu,", (unsigned long)n_headers,
          (unsigned long)n_video_headers, (unsigned long)(residual_sectors / 2));
+  printf("\"format_grid\":%lu,\"format_grid_offset\":%lu,", (unsigned long)grid_sectors, (unsigned long)grid_offset);
   printf("\"read_errors\":%lu},", (unsigned long)read_errors);
   RECORD_FLUSH();
 
@@ -1795,6 +1891,7 @@ int main(void) {
   } else {
     carve_raw(blocks);
   }
+  find_format_grid();
 
   print_media(have_info ? &info : NULL);
 
@@ -1818,24 +1915,30 @@ int main(void) {
     printf("\r\n");
     printf("  In a trash folder:              %lu files (%lu dirs)\r\n", (unsigned long)n_trashed_files,
            (unsigned long)n_trashed_dirs);
-    printf("  All present, total:             %lu files (%lu dirs), %lu bytes\r\n", (unsigned long)n_live_files,
-           (unsigned long)n_live_dirs, (unsigned long)live_bytes);
+    char live_dec[21];
+    printf("  All present, total:             %lu files (%lu dirs), %s bytes\r\n", (unsigned long)n_live_files,
+           (unsigned long)n_live_dirs, u64_dec(live_bytes, live_dec));
     printf("  Deleted directory entries:      %lu files, %lu dirs; %lu with data not reused\r\n",
            (unsigned long)n_del_files, (unsigned long)n_del_dirs, (unsigned long)n_del_intact);
     printf("    of which user / OS artifact:  %lu / %lu\r\n", (unsigned long)n_del_user, (unsigned long)n_del_os);
+    if (dirs_not_walked)
+      printf("  Directories not walked:         %lu (cluster holds no directory)\r\n", (unsigned long)dirs_not_walked);
+    if (dirs_too_deep)
+      printf("  Directories too deep to walk:   %lu (over %d levels) -- counts INCOMPLETE\r\n",
+             (unsigned long)dirs_too_deep, MAX_DEPTH);
   }
   printf("  Residual data in %s:   %lu KiB in %lu runs\r\n", have_fs ? "unallocated" : "the card   ",
-         (unsigned long)(residual_sectors / 2), (unsigned long)(n_raw_runs + n_headers));
+         (unsigned long)(residual_sectors / 2), (unsigned long)n_runs);
   printf("  File headers found there:       %lu (%lu video), %lu embedded\r\n", (unsigned long)n_headers,
          (unsigned long)n_video_headers, (unsigned long)n_nested);
   printf("  Read errors:                    %lu\r\n", (unsigned long)read_errors);
   printf("\r\n  Verdict: %s\r\n", verdict());
   if (n_user_files) printf("    user files PRESENT\r\n");
+  else if (n_os_files || n_os_dirs) printf("    no user files -- only artifacts of the OS that mounted it\r\n");
+  else printf("    no files present\r\n");
   if (n_files_damaged)
     printf("    %lu file(s) DAMAGED -- unreadable sectors in their data\r\n", (unsigned long)n_files_damaged);
   if (bad_sectors) printf("    media has bad sectors: %lu tried and failed\r\n", (unsigned long)bad_sectors);
-  else if (n_os_files || n_os_dirs) printf("    no user files -- only artifacts of the OS that mounted it\r\n");
-  else printf("    no files present\r\n");
   if (n_trashed_files) printf("    %lu file(s) in a trash folder: deleted by the user, still intact\r\n",
                               (unsigned long)n_trashed_files);
   if (n_del_user || n_headers) {
